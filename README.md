@@ -16,8 +16,7 @@ I've tested these in-game on 6 November 2026:
 
 The game logs confirm the renderers used for the Wallace tests, and the installed
 files match the successful cook. The DX11 test covers Wallace's opaque material;
-translucent materials still need a separate DX11 test. Other projects, game
-builds and engine builds need their own validation.
+translucent materials still need a separate DX11 test. 
 
 1. Close the editor and put the complete `LimelightShaderCooker` folder in your
    project's `Plugins` folder. Use the prebuilt download if you don't build C++.
@@ -29,10 +28,7 @@ builds and engine builds need their own validation.
    chunks, following your usual mod installation workflow.
 
 The output may also contain engine/plugin content and duplicate chunks from
-overlapping labels. For Wallace, chunk 1990 contains the complete mod; chunks
-2-6 contain duplicate copies of the same nine packages. I only installed the
-1990 set for its game tests. Don't copy the whole standalone build into the game.
-A tiny `.pak` is normal with IoStore: most asset data lives in the `.ucas`.
+overlapping labels.
 
 For a C++ project, I reuse its Win64 Development game binaries when the mod kit
 includes them. If they are missing, the cooker builds that target before making
@@ -61,10 +57,7 @@ stock renderer and shared cache.
 
 This version corrects the known `TranslucentBasePass` and `OpaqueBasePass`
 layouts. The opaque correction keeps the material's existing DBuffer decal
-response. It compiles to the game's registered opaque layout and corrects the
-original Haru shader's DBuffer resource indices. The combined Chun-Li test's
-installed container hashes and normal DiveBar load/exit were checked against
-the successful cook. Unknown layouts stop the cook instead of producing a
+response. Unknown layouts stop the cook instead of producing a
 guessed shader. The cooker retains stock shader logic while aligning the two
 known resource layouts.
 
