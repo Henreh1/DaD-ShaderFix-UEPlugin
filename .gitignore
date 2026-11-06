@@ -1,0 +1,12 @@
+Binaries/
+Intermediate/
+Saved/
+artifacts/
+.vs/
+Tests/
+Tools/ShaderWorker/bin/
+Tools/ShaderWorker/obj/
+Tools/ShaderWorker/.dotnet-home/
+Resources/Cooker/Worker/*
+__pycache__/
+*.zip

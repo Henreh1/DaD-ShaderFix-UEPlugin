@@ -1,0 +1,14 @@
+{
+  "id": "dad-cl35029-basepass-v2",
+  "gameChangelist": 35029,
+  "engineMajor": 5,
+  "engineMinor": 7,
+  "enginePatch": 4,
+  "engineChangelist": 51494982,
+  "nativeWorkerSha256": "221cc660c55832c04d519a45e008d6a5a30aa2878209619d03b6a45f5ed711a5",
+  "oldLayoutHash": "0x68f69cf4",
+  "newLayoutHash": "0x677b9998",
+  "opaqueOldLayoutHash": "0x04a8df25",
+  "opaqueNewLayoutHash": "0x1ec0cb1d",
+  "scope": "TranslucentBasePass and OpaqueBasePass; combined DBuffer-enabled and lit translucent Chun-Li test loaded on DX12/SM6, CL-35029"
+}
