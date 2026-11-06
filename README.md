@@ -1,5 +1,7 @@
 # Limelight Shader Cooker
 
+First public release: **0.1.0**.
+
 I use this to cook lit materials for Dead as Disco CL-35029 with the
 Epic UE 5.7.4 editor (CL-51494982). The correction keeps the original material's
 lighting, opacity graph and DBuffer decal response.
