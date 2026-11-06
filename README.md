@@ -88,3 +88,11 @@ fixed. The plugin itself detects the engine running the editor.
 The build script builds the .NET 8 worker and packages the editor plugin with
 UAT. Using the prebuilt plugin requires no separate Python installation or source-engine build;
 the cooker uses the engine's bundled Python and .NET runtime.
+
+<a href="https://brainmade.org/">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://brainmade.org/white-logo.svg">
+  <source media="(prefers-color-scheme: light)" srcset="https://brainmade.org/black-logo.svg">
+  <img alt="brainmade" src="https://brainmade.org/white-logo.svg">
+</picture>
+</a>
