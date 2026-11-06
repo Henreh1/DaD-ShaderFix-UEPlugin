@@ -4,6 +4,9 @@ I use this to cook lit materials for Dead as Disco CL-35029 with the
 Epic UE 5.7.4 editor (CL-51494982). The correction keeps the original material's
 lighting, opacity graph and DBuffer decal response.
 
+> [!IMPORTANT]
+> If you do not already you will need to install Visual Studio's **Game development with C++** tools
+
 I've tested these in-game on 6 November 2026:
 
 | Mod | Renderer | What worked |
