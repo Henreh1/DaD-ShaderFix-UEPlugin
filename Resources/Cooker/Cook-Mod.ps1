@@ -66,7 +66,9 @@ try {
         if ($outputRoot -eq $sourceFolder -or (Under $outputRoot $sourceFolder)) { throw 'Choose an output folder outside project source and content folders.' }
     }
     $mode = if ($requestData.PSObject.Properties['Mode']) { [string]$requestData.Mode } else { 'Folder' }
-    if ($mode -notin @('Asset','Folder','All')) { throw 'Unknown cook mode.' }
+    if ($mode -notin @('Asset','Map','Folder','All')) { throw 'Unknown cook mode.' }
+    if ($requestData.PSObject.Properties['ArenaCook'] -and $requestData.ArenaCook -isnot [bool]) { throw 'ArenaCook must be a JSON boolean.' }
+    $arenaCook = $mode -eq 'Map' -or ($requestData.PSObject.Properties['ArenaCook'] -and $requestData.ArenaCook)
     $contentFolder = if ($mode -eq 'Folder') { ([string]$requestData.ContentFolder).Replace('\','/').TrimEnd('/') } else { '/Game' }
     if ($contentFolder -ne '/Game' -and !$contentFolder.StartsWith('/Game/')) { throw 'The cook folder must start with /Game/.' }
     if ($contentFolder -match '(^|/)\.{1,2}(/|$)') { throw 'The cook folder contains dot segments.' }
@@ -76,20 +78,35 @@ try {
     if ($sourceContent -ne (Join-Path $sourceRoot 'Content') -and !(Under $sourceContent (Join-Path $sourceRoot 'Content'))) { throw 'The content folder escaped the project.' }
     $assetPackage = ''
     $assetPackages = @()
-    if ($mode -eq 'Asset') {
+    $mapPackages = @()
+    if ($mode -in @('Asset','Map')) {
         $assetPackage = [string]$requestData.AssetPackage
-        if (!$assetPackage.StartsWith('/Game/') -or $assetPackage -match '["%&|<>^!+\s:\\.]') { throw 'Choose a valid /Game/... data asset package.' }
-        $assetFile = Join-Path (Join-Path $sourceRoot 'Content') ($assetPackage.Substring(6) + '.uasset')
-        if (!(Test-Path -LiteralPath $assetFile -PathType Leaf)) { throw 'The selected data asset does not exist on disk. Save it before cooking.' }
+        if (!$assetPackage.StartsWith('/Game/') -or $assetPackage -match '["%&|<>^!+\s:\\.]') { throw 'Choose a valid /Game/... asset or map package.' }
+        $rootExtension = if ($mode -eq 'Map') { '.umap' } else { '.uasset' }
+        $assetFile = Join-Path (Join-Path $sourceRoot 'Content') ($assetPackage.Substring(6) + $rootExtension)
+        if (!(Test-Path -LiteralPath $assetFile -PathType Leaf)) { throw 'The selected asset or map does not exist on disk. Save it before cooking.' }
         $assetPackages = @(if ($requestData.PSObject.Properties['AssetPackages']) { $requestData.AssetPackages } else { $assetPackage })
         if (!$assetPackages.Count) { throw 'The selected data asset or label did not resolve to any packages to cook.' }
         foreach ($package in $assetPackages) {
             if (!$package.StartsWith('/Game/') -or $package -match '["%&|<>^!+\s:\\.]') { throw 'The selected asset resolved to an unsupported package path.' }
-            $packageFile = Join-Path (Join-Path $sourceRoot 'Content') ($package.Substring(6) + '.uasset')
-            if (!(Test-Path -LiteralPath $packageFile -PathType Leaf)) { throw ('A selected cook package does not exist: ' + $package) }
+            $packageBase = Join-Path (Join-Path $sourceRoot 'Content') $package.Substring(6)
+            if (Test-Path -LiteralPath ($packageBase + '.umap') -PathType Leaf) { $mapPackages += $package }
+            elseif (!(Test-Path -LiteralPath ($packageBase + '.uasset') -PathType Leaf)) { throw ('A selected cook package does not exist: ' + $package) }
         }
         $assetPackages = @($assetPackages | Sort-Object -Unique)
+        if ($mode -eq 'Map' -and $assetPackage -notin $mapPackages) { throw 'The requested map is missing from the selected cook packages.' }
+    } elseif ($mode -eq 'Folder' -and $arenaCook) {
+        $contentRoot = (Join-Path $sourceRoot 'Content').TrimEnd('\') + '\'
+        $mapPackages = @(Get-ChildItem -LiteralPath $sourceContent -Filter '*.umap' -Recurse -File | ForEach-Object {
+            '/Game/' + $_.FullName.Substring($contentRoot.Length, $_.FullName.Length - $contentRoot.Length - 5).Replace('\','/')
+        })
     }
+    $mapPackages = @($mapPackages | Sort-Object -Unique)
+    if ($mapPackages.Count -and !$arenaCook) { throw 'The selected label includes maps. Enable Cook as an arena, or select a character-only label.' }
+    foreach ($mapPackage in $mapPackages) {
+        if (!$mapPackage.StartsWith('/Game/') -or $mapPackage -match '["%&|<>^!+\s:\\.]') { throw 'A selected map has an unsupported package path.' }
+    }
+    $requestedPackages = @(@($assetPackages) + @($mapPackages) | Sort-Object -Unique)
     $runFolder = Join-Path $outputRoot $runId
     if (Test-Path -LiteralPath $runFolder) { throw 'The output run folder already exists; refusing to reuse it.' }
     [void][IO.Directory]::CreateDirectory($runFolder)
@@ -97,7 +114,10 @@ try {
     $consoleWriter = New-Object IO.StreamWriter((Join-Path $runFolder 'Console.txt'), $false, $utf8)
     $consoleWriter.AutoFlush = $true
     $result = [ordered]@{RunId=$runId;StartedUtc=[datetime]::UtcNow.ToString('o');Profile=$profile.id;Project=$projectFile;Mode=$mode;ContentFolder=$contentFolder;AssetPackage=$assetPackage;Succeeded=$false;Phase='Preflight';SourceMaterialsChanged=$false;SourceConfigChanged=$false}
-    $result['RequestedPackages'] = $assetPackages
+    $result['RequestedPackages'] = $requestedPackages
+    $result['RequestedMaps'] = $mapPackages
+    $result['ArenaCook'] = [bool]$arenaCook
+    $result['CookedContentVersioning'] = if ($arenaCook) { 'TaggedProperties' } else { 'EngineDefault' }
     $stallSeconds = if ($requestData.PSObject.Properties['ShaderStallSeconds']) { [int]$requestData.ShaderStallSeconds } else { 900 }
     if ($stallSeconds -lt 1 -or $stallSeconds -gt 7200) { throw 'ShaderStallSeconds must be between 1 and 7200.' }
     $result['ShaderStallSeconds'] = $stallSeconds
@@ -233,8 +253,12 @@ try {
         $additionalOptions = '-NoDefaultMaps -NoMaterialShaderDDC -ForceGenerateAllChunksInfo -DDC=' + $cacheName + ' -NullRHI -ForceDPCVars=' + $forceVars
         $cookRoots = @()
         if ($mode -eq 'Folder') { $cookRoots += '-CookDir=' + (Join-Path (Join-Path $copyRoot 'Content') $relativeContent) }
-        elseif ($mode -eq 'Asset') { $additionalOptions += ' -Package=' + ($assetPackages -join '+') }
+        elseif ($mode -in @('Asset','Map')) { $additionalOptions += ' -Package=' + ($assetPackages -join '+') }
         else { $cookRoots += '-CookAll' }
+        if ($arenaCook) {
+            $cookRoots += '-VersionCookedContent'
+            if ($mapPackages.Count) { $cookRoots += '-map=' + ($mapPackages -join '+') }
+        }
         $arguments = @('-WaitForUATMutex','BuildCookRun',('-project=' + $copyProject),'-targetplatform=Win64','-clientconfig=Development','-nocompileeditor','-skipbuildeditor','-cook') + $cookRoots + @(('-AdditionalCookerOptions=' + $additionalOptions),'-stage','-pak','-iostore','-manifests','-package','-archive',('-archivedirectory=' + (Join-Path $runFolder 'Build')),'-nop4','-utf8output')
         $result['Arguments'] = $arguments
         Write-Json $resultPath $result
@@ -268,7 +292,7 @@ try {
             $cookedPackages = @(Get-CookedPackageNames $copyProject)
             $result['CookedPackageCount'] = $cookedPackages.Count
             $result['CookedGamePackages'] = @($cookedPackages | Where-Object { $_.StartsWith('/Game/') })
-            $missingPackages = @(Get-MissingCookPackages $cookedPackages $assetPackages)
+            $missingPackages = @(Get-MissingCookPackages $cookedPackages $requestedPackages)
             $result['MissingRequestedPackages'] = $missingPackages
             if ($missingPackages.Count) { throw ('The cook omitted selected packages: ' + ($missingPackages -join ', ') + '. The output is not a complete mod.') }
             if ($mode -eq 'Folder' -and !@($cookedPackages | Where-Object { $_.StartsWith($contentFolder + '/', [StringComparison]::OrdinalIgnoreCase) }).Count) { throw 'The cook produced no packages from the selected content folder.' }

@@ -23,8 +23,8 @@ translucent materials still need a separate DX11 test.
 1. Close the editor and put the complete `LimelightShaderCooker` folder in your
    project's `Plugins` folder. Use the prebuilt download if you don't build C++.
 2. Reopen the project. Open **Tools > Cook for Dead as Disco**.
-3. Select **Data asset**, **Content folder**, or **Cook All**, choose an output
-   folder, then click **Cook Mod**. Data asset mode uses Unreal's asset picker.
+3. Select **Data asset**, **Arena map**, **Content folder**, or **Cook All**.
+   Choose an output folder, then click **Cook Mod**.
 4. Use **Open output folder**. The `Build` directory contains the usual packaged
    `.pak`, `.utoc` and `.ucas` files. Use the matching sets for your mod's assigned
    chunks, following your usual mod installation workflow.
@@ -47,6 +47,15 @@ Cook All requests the entire project, including unused content, while still
 respecting never-cook rules. These modes do not override other
 always-cook folders or force all assets into a new chunk. Check the chunks you
 normally distribute.
+
+Choose **Arena map** to cook a `.umap` and its dependencies. If you select an
+arena through a data asset label, a folder, or **Cook All**, tick
+**Cook as an arena**. The checkbox resets when you change modes. Arena cooks
+use `-VersionCookedContent` to keep property tags. Keep your usual arena paths
+and chunk assignments.
+
+I cooked `LI_Arena_Default` with **Arena map** and loaded it in Infinite Disco
+on CL-35029 (DX12 / SM6).
 
 I save the project before refreshing one separate working copy per project.
 Unchanged files are reused; changed and added files are copied, and files removed

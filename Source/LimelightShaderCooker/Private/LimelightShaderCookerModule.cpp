@@ -7,6 +7,7 @@
 #include "Dom/JsonObject.h"
 #include "Engine/DataAsset.h"
 #include "Engine/PrimaryAssetLabel.h"
+#include "Engine/World.h"
 #include "FileHelpers.h"
 #include "Framework/Application/SlateApplication.h"
 #include "HAL/FileManager.h"
@@ -115,7 +116,7 @@ class FCookSession
 public:
     ~FCookSession() { Stop(); }
 
-    bool Start(const FString& Mode, const FString& AssetPath, const FString& Folder, const FString& OutputRoot, bool bDebug)
+    bool Start(const FString& Mode, const FString& AssetPath, const FString& Folder, const FString& OutputRoot, bool bDebug, bool bArenaCook)
     {
         if (bRunning) return false;
         const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("LimelightShaderCooker"));
@@ -135,8 +136,9 @@ public:
         if (Mode == TEXT("Folder") && !IFileManager::Get().DirectoryExists(*DiskFolder))
             return Fail(TEXT("The selected content folder does not exist."));
         const FString AssetPackage = FPackageName::ObjectPathToPackageName(AssetPath);
-        if (Mode == TEXT("Asset") && (!AssetPackage.StartsWith(TEXT("/Game/")) || !FPackageName::IsValidLongPackageName(AssetPackage)))
-            return Fail(TEXT("Select a saved data asset from this project's Content directory."));
+        const bool bAssetSelection = Mode == TEXT("Asset") || Mode == TEXT("Map");
+        if (bAssetSelection && (!AssetPackage.StartsWith(TEXT("/Game/")) || !FPackageName::IsValidLongPackageName(AssetPackage)))
+            return Fail(TEXT("Select a saved asset or arena map from this project's Content directory."));
         if (OutputRoot.TrimStartAndEnd().IsEmpty() || OutputRoot.Contains(TEXT("\"")) || OutputRoot.Contains(TEXT("\n")))
             return Fail(TEXT("Choose an output folder."));
         const FString Script = FullPath(FPaths::Combine(Plugin->GetBaseDir(), TEXT("Resources/Cooker/Cook-Mod.ps1")));
@@ -145,11 +147,11 @@ public:
         // I save before making the cook copy so it uses the assets shown in the editor.
         if (!FEditorFileUtils::SaveDirtyPackages(true, true, true, false, false, false))
             return Fail(TEXT("Cook cancelled because modified assets were not saved."));
-        if (Mode == TEXT("Asset") && !FPackageName::DoesPackageExist(AssetPackage))
-            return Fail(TEXT("The selected data asset could not be found on disk after saving."));
+        if (bAssetSelection && !FPackageName::DoesPackageExist(AssetPackage))
+            return Fail(TEXT("The selected asset or map could not be found on disk after saving."));
         TArray<FString> CookPackages;
         FString SelectionError;
-        if (Mode == TEXT("Asset") && !ResolveCookPackages(AssetPath, CookPackages, SelectionError)) return Fail(SelectionError);
+        if (bAssetSelection && !ResolveCookPackages(AssetPath, CookPackages, SelectionError)) return Fail(SelectionError);
 
         const FString RunId = FDateTime::UtcNow().ToString(TEXT("%Y%m%d-%H%M%S-")) + FGuid::NewGuid().ToString(EGuidFormats::Digits).Left(8);
         const FString RequestFolder = FullPath(FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("ShaderCooker/Requests")));
@@ -168,6 +170,7 @@ public:
         Request->SetStringField(TEXT("WorkRoot"), FullPath(FPaths::Combine(FPlatformProcess::UserTempDir(), TEXT("LimelightSC"))));
         Request->SetStringField(TEXT("RunId"), RunId);
         Request->SetBoolField(TEXT("ShaderDebug"), bDebug);
+        Request->SetBoolField(TEXT("ArenaCook"), Mode == TEXT("Map") || bArenaCook);
         FString Json;
         FJsonSerializer::Serialize(Request, TJsonWriterFactory<>::Create(&Json));
         const FString RequestPath = FPaths::Combine(RequestFolder, RunId + TEXT(".json"));
@@ -194,7 +197,7 @@ public:
         ++LogRevision;
         GConfig->SetString(SettingsSection, TEXT("ContentFolder"), *ContentFolder, GEditorPerProjectIni);
         GConfig->SetString(SettingsSection, TEXT("Mode"), *Mode, GEditorPerProjectIni);
-        GConfig->SetString(SettingsSection, TEXT("AssetPath"), *AssetPath, GEditorPerProjectIni);
+        if (bAssetSelection) GConfig->SetString(SettingsSection, Mode == TEXT("Map") ? TEXT("MapPath") : TEXT("AssetPath"), *AssetPath, GEditorPerProjectIni);
         GConfig->SetString(SettingsSection, TEXT("OutputRoot"), *FullPath(OutputRoot.TrimStartAndEnd()), GEditorPerProjectIni);
         GConfig->Flush(false, GEditorPerProjectIni);
         return true;
@@ -389,8 +392,9 @@ public:
         GConfig->GetString(SettingsSection, TEXT("OutputRoot"), OutputRoot, GEditorPerProjectIni);
         GConfig->GetString(SettingsSection, TEXT("Mode"), Mode, GEditorPerProjectIni);
         GConfig->GetString(SettingsSection, TEXT("AssetPath"), AssetPath, GEditorPerProjectIni);
-        ModeOptions = {MakeShared<FString>(TEXT("Data asset")), MakeShared<FString>(TEXT("Content folder")), MakeShared<FString>(TEXT("Cook All"))};
-        const int32 ModeIndex = Mode == TEXT("Asset") ? 0 : Mode == TEXT("All") ? 2 : 1;
+        GConfig->GetString(SettingsSection, TEXT("MapPath"), MapPath, GEditorPerProjectIni);
+        ModeOptions = {MakeShared<FString>(TEXT("Data asset")), MakeShared<FString>(TEXT("Content folder")), MakeShared<FString>(TEXT("Cook All")), MakeShared<FString>(TEXT("Arena map"))};
+        const int32 ModeIndex = Mode == TEXT("Asset") ? 0 : Mode == TEXT("All") ? 2 : Mode == TEXT("Map") ? 3 : 1;
         ChildSlot
         [
             SNew(SBorder).Padding(20)
@@ -409,12 +413,16 @@ public:
                     + SVerticalBox::Slot().AutoHeight().Padding(0, 4, 0, 12)
                     [ SNew(SComboBox<TSharedPtr<FString>>).OptionsSource(&ModeOptions).InitiallySelectedItem(ModeOptions[ModeIndex]).IsEnabled_Lambda([this] { return !Session->bRunning; })
                         .OnGenerateWidget_Lambda([](TSharedPtr<FString> Item) { return SNew(STextBlock).Text(FText::FromString(*Item)); })
-                        .OnSelectionChanged_Lambda([this](TSharedPtr<FString> Item, ESelectInfo::Type) { Mode = Item == ModeOptions[0] ? TEXT("Asset") : Item == ModeOptions[2] ? TEXT("All") : TEXT("Folder"); })
-                        [ SNew(STextBlock).Text_Lambda([this] { return FText::FromString(Mode == TEXT("Asset") ? TEXT("Data asset") : Mode == TEXT("All") ? TEXT("Cook All") : TEXT("Content folder")); }) ] ]
+                        .OnSelectionChanged_Lambda([this](TSharedPtr<FString> Item, ESelectInfo::Type) { Mode = Item == ModeOptions[0] ? TEXT("Asset") : Item == ModeOptions[2] ? TEXT("All") : Item == ModeOptions[3] ? TEXT("Map") : TEXT("Folder"); bArenaCook = false; })
+                        [ SNew(STextBlock).Text_Lambda([this] { return FText::FromString(Mode == TEXT("Asset") ? TEXT("Data asset") : Mode == TEXT("All") ? TEXT("Cook All") : Mode == TEXT("Map") ? TEXT("Arena map") : TEXT("Content folder")); }) ] ]
                     + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 12)
                     [ SNew(SBox).Visibility_Lambda([this] { return Mode == TEXT("Asset") ? EVisibility::Visible : EVisibility::Collapsed; })
                         [ SNew(SObjectPropertyEntryBox).AllowedClass(UDataAsset::StaticClass()).AllowClear(true).ObjectPath_Lambda([this] { return AssetPath; }).IsEnabled_Lambda([this] { return !Session->bRunning; })
                             .OnObjectChanged_Lambda([this](const FAssetData& Asset) { AssetPath = Asset.GetSoftObjectPath().ToString(); }) ] ]
+                    + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 12)
+                    [ SNew(SBox).Visibility_Lambda([this] { return Mode == TEXT("Map") ? EVisibility::Visible : EVisibility::Collapsed; })
+                        [ SNew(SObjectPropertyEntryBox).AllowedClass(UWorld::StaticClass()).AllowClear(true).ObjectPath_Lambda([this] { return MapPath; }).IsEnabled_Lambda([this] { return !Session->bRunning; })
+                            .OnObjectChanged_Lambda([this](const FAssetData& Asset) { MapPath = Asset.GetSoftObjectPath().ToString(); }) ] ]
                     + SVerticalBox::Slot().AutoHeight().Padding(0, 4, 0, 5)
                     [
                         SNew(SHorizontalBox).Visibility_Lambda([this] { return Mode == TEXT("Folder") ? EVisibility::Visible : EVisibility::Collapsed; })
@@ -423,6 +431,12 @@ public:
                     ]
                     + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 14)
                     [ SNew(STextBlock).Text_Lambda([this] { return FText::FromString(Mode == TEXT("All") ? TEXT("Cooks the whole project, including unused content. Existing never-cook rules and chunk labels still apply.") : TEXT("Includes the selected asset or folder and its referenced dependencies. Existing packaging rules and chunk labels still apply.")); }).AutoWrapText(true).ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
+                    + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 14)
+                    [ SNew(SCheckBox).Visibility_Lambda([this] { return Mode == TEXT("Map") ? EVisibility::Collapsed : EVisibility::Visible; })
+                        .IsEnabled_Lambda([this] { return !Session->bRunning; })
+                        .IsChecked_Lambda([this] { return bArenaCook ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                        .OnCheckStateChanged_Lambda([this](ECheckBoxState State) { bArenaCook = State == ECheckBoxState::Checked; })
+                        [ SNew(STextBlock).Text(LOCTEXT("ArenaCook", "Cook as an arena")).ToolTipText(LOCTEXT("ArenaCookHelp", "Enable this when the selected asset label, folder or whole project is an arena mod. Arena map mode enables it automatically.")) ] ]
                     + SVerticalBox::Slot().AutoHeight()[ SNew(STextBlock).Text(LOCTEXT("OutputLabel", "Output folder")) ]
                     + SVerticalBox::Slot().AutoHeight().Padding(0, 4, 0, 14)
                     [
@@ -438,7 +452,7 @@ public:
                         SNew(SHorizontalBox)
                         + SHorizontalBox::Slot().AutoWidth()
                         [ SNew(SButton).HAlign(HAlign_Center).VAlign(VAlign_Center).ButtonStyle(FAppStyle::Get(), "PrimaryButton").ContentPadding(FMargin(18, 8)).Text(LOCTEXT("Cook", "Cook Mod")).IsEnabled_Lambda([this] { return !Session->bRunning; }).OnClicked_Lambda([this] {
-                            if (Session->Start(Mode, AssetPath, ContentBox->GetText().ToString(), OutputBox->GetText().ToString(), DebugBox->IsChecked())) bFollowLog = true;
+                            if (Session->Start(Mode, Mode == TEXT("Map") ? MapPath : AssetPath, ContentBox->GetText().ToString(), OutputBox->GetText().ToString(), DebugBox->IsChecked(), bArenaCook)) bFollowLog = true;
                             return FReply::Handled();
                         }) ]
                         + SHorizontalBox::Slot().AutoWidth().Padding(8, 0)
@@ -508,6 +522,8 @@ private:
     bool bFollowLog = true;
     FString Mode = TEXT("Asset");
     FString AssetPath;
+    FString MapPath;
+    bool bArenaCook = false;
     TArray<TSharedPtr<FString>> ModeOptions;
 };
 }

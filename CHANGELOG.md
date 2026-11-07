@@ -2,6 +2,8 @@
 
 ## 0.2.0 (unreleased)
 
+- Added **Arena map** mode and a **Cook as an arena** option. Arena cooks keep
+  property tags and apply the shader corrections.
 - The cooker now reuses one working copy per project and syncs changed files
   before each cook. The first cook still needs to make a copy.
 - Fixed the text alignment on the **Cook Mod**, **Cancel**, and
