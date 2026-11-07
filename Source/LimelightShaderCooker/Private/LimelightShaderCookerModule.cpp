@@ -1,4 +1,5 @@
 #include "Containers/Queue.h"
+#include "CookLogTail.h"
 #include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Containers/Ticker.h"
@@ -38,6 +39,11 @@
 #include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Text/STextBlock.h"
 
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Misc/AutomationTest.h"
+#include "Misc/ScopeExit.h"
+#endif
+
 DEFINE_LOG_CATEGORY_STATIC(LogLimelightShaderCooker, Log, All);
 #define LOCTEXT_NAMESPACE "LimelightShaderCooker"
 
@@ -46,6 +52,7 @@ namespace
 const FName CookerTab(TEXT("LimelightShaderCooker"));
 constexpr int32 PendingExit = MIN_int32;
 const TCHAR* SettingsSection = TEXT("LimelightShaderCooker");
+constexpr TCHAR StatusPrefix[] = TEXT("LIMELIGHT_STATUS ");
 
 FString FullPath(const FString& Path)
 {
@@ -175,11 +182,16 @@ public:
         Process->OnCompleted().BindLambda([SharedState](int32 Code) { SharedState->ExitCode.Store(Code); });
         Process->OnCanceled().BindLambda([SharedState]() { SharedState->ExitCode.Store(-2); });
         if (!Process->Launch()) { Process.Reset(); return Fail(TEXT("Could not start the cook helper.")); }
+        StartedAt = FPlatformTime::Seconds();
         bRunning = true;
         bCooking = false;
+        bCancelling = false;
         bError = false;
         Status = TEXT("Checking project and preparing a cook copy...");
         Output.Empty();
+        LogTail = FCookLogTail();
+        NextLogRead = 0.0;
+        ++LogRevision;
         GConfig->SetString(SettingsSection, TEXT("ContentFolder"), *ContentFolder, GEditorPerProjectIni);
         GConfig->SetString(SettingsSection, TEXT("Mode"), *Mode, GEditorPerProjectIni);
         GConfig->SetString(SettingsSection, TEXT("AssetPath"), *AssetPath, GEditorPerProjectIni);
@@ -190,23 +202,58 @@ public:
 
     void Tick()
     {
-        if (!State) return;
+        if (!bRunning || !State) return;
+        const int32 Code = State->ExitCode.Load();
+        const double Now = FPlatformTime::Seconds();
+        if (Now >= NextLogRead || Code != PendingExit)
+        {
+            if (LogTail.Update(LastOutput, Code != PendingExit, Output)) ++LogRevision;
+            NextLogRead = Now + 0.25;
+        }
         FString Line;
+        bool bPipeOutputChanged = false;
         while (State->Lines.Dequeue(Line))
         {
             UE_LOG(LogLimelightShaderCooker, Display, TEXT("%s"), *Line);
-            Output += Line + TEXT("\n");
-            if (Output.Len() > 10000) Output.RightInline(8000);
-            if (Line.StartsWith(TEXT("LIMELIGHT_STATUS ")))
+            if (!LogTail.HasFile())
             {
-                Status = Line.RightChop(17);
-                bCooking = Status.StartsWith(TEXT("Cooking the saved project copy."));
+                Output += Line + TEXT("\n");
+                bPipeOutputChanged = true;
+            }
+            if (Line.StartsWith(StatusPrefix))
+            {
+                const FString Message = Line.RightChop(UE_ARRAY_COUNT(StatusPrefix) - 1);
+                if (LogTail.IsUatLog())
+                {
+                    if (!Output.IsEmpty() && !Output.EndsWith(TEXT("\n"))) Output.AppendChar('\n');
+                    Output += TEXT("[Cooker] ") + Message + TEXT("\n");
+                    bPipeOutputChanged = true;
+                }
+                if (!bCancelling)
+                {
+                    Status = Message;
+                    const bool bShaderProgress = Status.StartsWith(TEXT("Compiling shaders:"));
+                    if (bShaderProgress)
+                    {
+                        const int32 ElapsedIndex = Status.Find(TEXT(" Elapsed "), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+                        if (ElapsedIndex != INDEX_NONE) Status.LeftInline(ElapsedIndex, EAllowShrinking::No);
+                    }
+                    bCooking = bShaderProgress || Status.StartsWith(TEXT("Cooking the saved project copy."));
+                }
             }
         }
-        if (!bRunning || State->ExitCode.Load() == PendingExit) return;
-        const int32 Code = State->ExitCode.Load();
+        if (bPipeOutputChanged)
+        {
+            FCookLogTail::Trim(Output);
+            ++LogRevision;
+        }
+        if (Code == PendingExit) return;
         Process.Reset();
+        State.Reset();
+        FinishedAt = Now;
         bRunning = false;
+        bCooking = false;
+        bCancelling = false;
         bError = Code != 0;
         if (Code == -2) Status = TEXT("Cook cancelled. Partial files and diagnostics remain in the output folder.");
         else if (Code != 0) Status = FString::Printf(TEXT("Cook failed (exit %d). Open the output folder and check Console.txt."), Code);
@@ -237,23 +284,97 @@ public:
     {
         if (!bRunning || !bCooking) return Status;
         const int32 Dots = 1 + static_cast<int32>(FPlatformTime::Seconds() * 2.0) % 3;
-        return TEXT("Cooking, bear with me :D ") + FString::ChrN(Dots, TEXT('.')) + TEXT("\nProject copy ready. You can continue editing the source project.");
+        const FString Heading = TEXT("Cooking, bear with me :D ") + FString::ChrN(Dots, TEXT('.'));
+        if (Status.StartsWith(TEXT("Compiling shaders:"))) return Heading + TEXT("\n") + Status;
+        return Heading + TEXT("\nProject copy ready. You can continue editing the source project.");
     }
 
-    void Cancel() { if (Process && bRunning) { bCooking = false; Process->Cancel(true); Status = TEXT("Cancelling cook..."); } }
-    void Stop() { if (Process) { Process->Cancel(true); Process.Reset(); } bRunning = false; bCooking = false; }
+    FString DisplayElapsed(double Now) const
+    {
+        if (StartedAt < 0.0) return FString();
+        const double End = bRunning ? Now : FinishedAt;
+        const int64 Seconds = static_cast<int64>(FMath::Max(0.0, End - StartedAt));
+        return FString::Printf(TEXT("Elapsed %lld:%02lld:%02lld"), Seconds / 3600, Seconds / 60 % 60, Seconds % 60);
+    }
+
+    void Cancel()
+    {
+        if (!Process || !bRunning || bCancelling) return;
+        bCancelling = true;
+        bCooking = false;
+        Process->Cancel(true);
+        Status = TEXT("Cancelling cook...");
+    }
+    void Stop()
+    {
+        if (Process) { Process->Cancel(true); Process.Reset(); }
+        if (bRunning) FinishedAt = FPlatformTime::Seconds();
+        bRunning = false;
+        bCooking = false;
+    }
     bool Fail(const FString& Message) { Status = Message; bError = true; return false; }
+    bool IsShowingUatLog() const { return LogTail.IsUatLog(); }
     bool bRunning = false;
     bool bError = false;
     FString LastOutput;
     FString Status = TEXT("Ready. Choose your mod folder and cook.");
     FString Output;
+    uint64 LogRevision = 0;
 
 private:
+#if WITH_DEV_AUTOMATION_TESTS
+    friend class FCookProgressPanelTest;
+#endif
     bool bCooking = false;
+    bool bCancelling = false;
+    double StartedAt = -1.0;
+    double FinishedAt = -1.0;
+    double NextLogRead = 0.0;
+    FCookLogTail LogTail;
     TUniquePtr<FMonitoredProcess> Process;
     TSharedPtr<FProcessState, ESPMode::ThreadSafe> State;
 };
+
+#if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCookProgressPanelTest, "Limelight.ShaderCooker.QuietUatProgress",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCookProgressPanelTest::RunTest(const FString& Parameters)
+{
+    FCookSession Session;
+    Session.LastOutput = FPaths::Combine(FPaths::AutomationTransientDir(), FGuid::NewGuid().ToString(EGuidFormats::Digits));
+    const FString LogFolder = FPaths::Combine(Session.LastOutput, TEXT("UATLogs/attempt-1"));
+    const FString Log = FPaths::Combine(LogFolder, TEXT("Log.txt"));
+    IFileManager& Files = IFileManager::Get();
+    Files.MakeDirectory(*LogFolder, true);
+    ON_SCOPE_EXIT
+    {
+        Files.Delete(*Log);
+        Files.DeleteDirectory(*LogFolder);
+        Files.DeleteDirectory(*FPaths::GetPath(LogFolder));
+        Files.DeleteDirectory(*Session.LastOutput);
+    };
+    if (!TestTrue(TEXT("Write a quiet UAT log"), FFileHelper::SaveStringToFile(TEXT("Sandbox cleanup\n"), *Log, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))) return false;
+
+    Session.bRunning = true;
+    Session.StartedAt = FPlatformTime::Seconds();
+    Session.State = MakeShared<FProcessState, ESPMode::ThreadSafe>();
+    Session.Tick();
+    TestEqual(TEXT("Show the UAT file"), Session.Output, FString(TEXT("Sandbox cleanup\n")));
+    const uint64 PreviousRevision = Session.LogRevision;
+    Session.State->Lines.Enqueue(TEXT("LIMELIGHT_STATUS Compiling shaders: 7 completed. Elapsed 0:00:05."));
+    Session.Tick();
+    TestTrue(TEXT("A cooker update refreshes the panel while UAT is quiet"), Session.LogRevision > PreviousRevision);
+    TestEqual(TEXT("Progress follows the UAT lines"), Session.Output, FString(TEXT("Sandbox cleanup\n[Cooker] Compiling shaders: 7 completed. Elapsed 0:00:05.\n")));
+    TestFalse(TEXT("The status does not show the sampled elapsed time"), Session.DisplayStatus().Contains(TEXT("Elapsed")));
+    TestEqual(TEXT("Elapsed time after one second"), Session.DisplayElapsed(Session.StartedAt + 1.25), FString(TEXT("Elapsed 0:00:01")));
+    TestEqual(TEXT("The next second needs no progress update"), Session.DisplayElapsed(Session.StartedAt + 2.25), FString(TEXT("Elapsed 0:00:02")));
+    Session.State->ExitCode.Store(-2);
+    Session.Tick();
+    TestEqual(TEXT("The elapsed time freezes when the cook exits"), Session.DisplayElapsed(Session.FinishedAt + 10.0), Session.DisplayElapsed(Session.FinishedAt));
+    return true;
+}
+#endif
 
 class SCookerPanel : public SCompoundWidget
 {
@@ -310,24 +431,43 @@ public:
                         + SHorizontalBox::Slot().AutoWidth().Padding(6, 0)[ SNew(SButton).Text(LOCTEXT("BrowseOutput", "Browse...")).IsEnabled_Lambda([this] { return !Session->bRunning; }).OnClicked(this, &SCookerPanel::BrowseOutput) ]
                     ]
                     + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 14)
-                    [ SAssignNew(DebugBox, SCheckBox).IsEnabled_Lambda([this] { return !Session->bRunning; })[ SNew(STextBlock).Text(LOCTEXT("Debug", "Save shader debug files (larger output)")) ] ]
+                    [ SAssignNew(DebugBox, SCheckBox).IsEnabled_Lambda([this] { return !Session->bRunning; })
+                        [ SNew(STextBlock).Text(LOCTEXT("Debug", "Save shader debug files (larger output, for Henreh's sanity)")).AutoWrapText(true) ] ]
                     + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 10)
                     [
                         SNew(SHorizontalBox)
                         + SHorizontalBox::Slot().AutoWidth()
-                        [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "PrimaryButton").ContentPadding(FMargin(18, 8)).Text(LOCTEXT("Cook", "Cook Mod")).IsEnabled_Lambda([this] { return !Session->bRunning; }).OnClicked_Lambda([this] { Session->Start(Mode, AssetPath, ContentBox->GetText().ToString(), OutputBox->GetText().ToString(), DebugBox->IsChecked()); return FReply::Handled(); }) ]
+                        [ SNew(SButton).HAlign(HAlign_Center).VAlign(VAlign_Center).ButtonStyle(FAppStyle::Get(), "PrimaryButton").ContentPadding(FMargin(18, 8)).Text(LOCTEXT("Cook", "Cook Mod")).IsEnabled_Lambda([this] { return !Session->bRunning; }).OnClicked_Lambda([this] {
+                            if (Session->Start(Mode, AssetPath, ContentBox->GetText().ToString(), OutputBox->GetText().ToString(), DebugBox->IsChecked())) bFollowLog = true;
+                            return FReply::Handled();
+                        }) ]
                         + SHorizontalBox::Slot().AutoWidth().Padding(8, 0)
-                        [ SNew(SButton).Text(LOCTEXT("Cancel", "Cancel")).IsEnabled_Lambda([this] { return Session->bRunning; }).OnClicked_Lambda([this] { Session->Cancel(); return FReply::Handled(); }) ]
+                        [ SNew(SButton).HAlign(HAlign_Center).VAlign(VAlign_Center).Text(LOCTEXT("Cancel", "Cancel")).IsEnabled_Lambda([this] { return Session->bRunning; }).OnClicked_Lambda([this] { Session->Cancel(); return FReply::Handled(); }) ]
                         + SHorizontalBox::Slot().AutoWidth()
-                        [ SNew(SButton).Text(LOCTEXT("Open", "Open output folder")).IsEnabled_Lambda([this] { return !Session->LastOutput.IsEmpty() && IFileManager::Get().DirectoryExists(*Session->LastOutput); }).OnClicked_Lambda([this] { FPlatformProcess::ExploreFolder(*Session->LastOutput); return FReply::Handled(); }) ]
+                        [ SNew(SButton).HAlign(HAlign_Center).VAlign(VAlign_Center).Text(LOCTEXT("Open", "Open output folder")).IsEnabled_Lambda([this] { return !Session->LastOutput.IsEmpty() && IFileManager::Get().DirectoryExists(*Session->LastOutput); }).OnClicked_Lambda([this] { FPlatformProcess::ExploreFolder(*Session->LastOutput); return FReply::Handled(); }) ]
                     ]
                     + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 12)
                     [ SNew(STextBlock).Text_Lambda([this] { return FText::FromString(Session->DisplayStatus()); }).ColorAndOpacity_Lambda([this] { return Session->bError ? FSlateColor(FLinearColor(1, 0.3f, 0.2f)) : FSlateColor::UseForeground(); }).AutoWrapText(true) ]
+                    + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 4)
+                    [ SNew(STextBlock).Text_Lambda([this] { return FText::FromString(Session->DisplayElapsed(FPlatformTime::Seconds())); }) ]
+                    + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 4)
+                    [ SNew(STextBlock).Text_Lambda([this] { return Session->IsShowingUatLog() ? LOCTEXT("UatLog", "UAT log and cooker progress") : LOCTEXT("CookerLog", "Cooker log"); }) ]
                     + SVerticalBox::Slot().AutoHeight()
-                    [ SNew(SBox).HeightOverride(230)[ SNew(SMultiLineEditableTextBox).IsReadOnly(true).Text_Lambda([this] { return FText::FromString(Session->Output); }) ] ]
+                    [ SNew(SBox).HeightOverride(230)
+                        [ SAssignNew(LogBox, SMultiLineEditableTextBox).IsReadOnly(true)
+                            .OnVScrollBarUserScrolled_Lambda([this](float Offset) { bFollowLog = FMath::IsNearlyEqual(Offset, 1.0f); }) ] ]
                 ]
             ]
         ];
+    }
+
+    virtual void Tick(const FGeometry& Geometry, const double CurrentTime, const float DeltaTime) override
+    {
+        SCompoundWidget::Tick(Geometry, CurrentTime, DeltaTime);
+        if (DisplayedLogRevision == Session->LogRevision) return;
+        DisplayedLogRevision = Session->LogRevision;
+        LogBox->SetText(FText::FromString(Session->Output));
+        if (bFollowLog) LogBox->ScrollTo(ETextLocation::EndOfDocument);
     }
 
 private:
@@ -363,6 +503,9 @@ private:
     TSharedPtr<FCookSession> Session;
     TSharedPtr<SEditableTextBox> ContentBox, OutputBox;
     TSharedPtr<SCheckBox> DebugBox;
+    TSharedPtr<SMultiLineEditableTextBox> LogBox;
+    uint64 DisplayedLogRevision = MAX_uint64;
+    bool bFollowLog = true;
     FString Mode = TEXT("Asset");
     FString AssetPath;
     TArray<TSharedPtr<FString>> ModeOptions;

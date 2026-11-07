@@ -73,6 +73,9 @@ response. Unknown layouts stop the cook instead of producing a
 guessed shader. The cooker retains stock shader logic while aligning the two
 known resource layouts.
 
+The log panel follows UAT and shows shader progress when UAT is quiet. Elapsed
+time updates independently and stops when the cook ends.
+
 `Console.txt`, `UATLogs` and `Result.json` are saved with each run. Enable **Save
 shader debug files** if you need compiler diagnostics. Normal cooks discard
 completed shader batch captures; debug-enabled cooks retain corrected batches,
