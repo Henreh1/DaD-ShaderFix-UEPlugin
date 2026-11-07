@@ -35,14 +35,20 @@ internal static class Program
     {
         var start = new ProcessStartInfo(executable) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = directory, RedirectStandardOutput = true, RedirectStandardError = true };
         foreach (var argument in arguments) start.ArgumentList.Add(argument);
+        Record(new { action = "launching-child", executable, directory });
         using var child = Process.Start(start) ?? throw new IOException("Could not start the shader adapter child process.");
-        var stdout = child.StandardOutput.ReadToEndAsync();
-        var stderr = child.StandardError.ReadToEndAsync();
+        Record(new { action = "child-started", executable, childId = child.Id });
+        using var stdoutFile = new FileStream(stdoutPath, FileMode.Create, FileAccess.Write, FileShare.Read);
+        using var stderrFile = new FileStream(stderrPath, FileMode.Create, FileAccess.Write, FileShare.Read);
+        var stdout = child.StandardOutput.BaseStream.CopyToAsync(stdoutFile);
+        var stderr = child.StandardError.BaseStream.CopyToAsync(stderrFile);
         using var deadline = new CancellationTokenSource(TimeSpan.FromMinutes(15));
-        try { await child.WaitForExitAsync(deadline.Token); }
-        catch (OperationCanceledException) { child.Kill(entireProcessTree: true); throw new TimeoutException("Owned shader child process exceeded its timeout."); }
-        await File.WriteAllTextAsync(stdoutPath, await stdout);
-        await File.WriteAllTextAsync(stderrPath, await stderr);
+        try { await Task.WhenAll(child.WaitForExitAsync(deadline.Token), stdout, stderr).WaitAsync(deadline.Token); }
+        catch (OperationCanceledException)
+        {
+            if (!child.HasExited) child.Kill(entireProcessTree: true);
+            throw new TimeoutException("Owned shader child process or output stream exceeded its timeout.");
+        }
         return child.ExitCode;
     }
 
@@ -55,6 +61,11 @@ internal static class Program
 
     public static async Task<int> Main(string[] args)
     {
+        if (args.Length == 2 && args[0] == "--supervise-cook")
+        {
+            try { return await CookSupervisor.Run(args[1]); }
+            catch (Exception error) { Console.Error.WriteLine("LIMELIGHT_STATUS Cook monitor failed: " + error.Message); return 1; }
+        }
         try
         {
             var settings = JsonSerializer.Deserialize<AdapterSettings>(File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "ShaderAdapter.json"))) ?? throw new IOException("Missing adapter settings.");
@@ -73,9 +84,10 @@ internal static class Program
                 if (Path.GetFileName(fileName) != fileName || fileName.Contains("..")) throw new IOException("Task arguments must be file names within the working directory.");
             taskInput = Path.Combine(working, args[3]);
             taskOutput = Path.Combine(working, args[4]);
+            var parentId = int.Parse(args[1]);
+            Record(new { action = "boot", working, parentId, inputFile = args[3], outputFile = args[4] });
             using (var stream = File.OpenRead(settings.NativeWorker))
                 if (Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(stream)).ToLowerInvariant() != settings.NativeWorkerSha256) throw new IOException("Native shader worker version changed.");
-            var parentId = int.Parse(args[1]);
             var once = args.Contains("--adapter-test-once");
             var cookProject = Environment.GetEnvironmentVariable("LIMELIGHT_SHADER_COOK_PROJECT");
             var token = Environment.GetEnvironmentVariable("LIMELIGHT_SHADER_COOK_TOKEN");
@@ -136,7 +148,8 @@ internal static class Program
                 var temporaryOutput = output + ".adapter-" + Environment.ProcessId;
                 await File.WriteAllBytesAsync(temporaryOutput, nativeBytes);
                 File.Move(temporaryOutput, output, overwrite: true);
-                Record(new { action = "completed", batch, changed, outputBytes = nativeBytes.Length, evidence = changed > 0 && settings.KeepShaderDebug ? job : null });
+                idle.Restart();
+                Record(new { action = "completed", batch, jobs = report.RootElement.GetProperty("jobs").GetInt32(), changed, outputBytes = nativeBytes.Length, evidence = changed > 0 && settings.KeepShaderDebug ? job : null });
                 if (changed == 0 || !settings.KeepShaderDebug)
                 {
                     var resolvedJob = Canonical(job);
@@ -150,7 +163,8 @@ internal static class Program
         }
         catch (Exception error)
         {
-            if (logPath.Length > 0) Record(new { action = "fatal", error = error.ToString() });
+            try { if (logPath.Length > 0) Record(new { action = "fatal", timedOut = error is TimeoutException, error = error.ToString() }); }
+            catch (IOException logError) { Console.Error.WriteLine("Could not write worker log: " + logError.Message); }
             try { await ReportFailure(error); }
             catch (Exception handoffError) { Console.Error.WriteLine("Could not publish worker failure: " + handoffError.Message); }
             Console.Error.WriteLine(error);

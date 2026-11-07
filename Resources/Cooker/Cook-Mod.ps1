@@ -49,6 +49,7 @@ try {
     . (Join-Path $PSScriptRoot 'Native-Build.ps1')
     . (Join-Path $PSScriptRoot 'Cook-Results.ps1')
     . (Join-Path $PSScriptRoot 'Workspace.ps1')
+    . (Join-Path $PSScriptRoot 'Cook-Recovery.ps1')
     $requestData = Get-Content -LiteralPath $Request -Raw -Encoding UTF8 | ConvertFrom-Json
     $profile = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'profile.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     $projectFile = Canonical $requestData.Project
@@ -97,6 +98,9 @@ try {
     $consoleWriter.AutoFlush = $true
     $result = [ordered]@{RunId=$runId;StartedUtc=[datetime]::UtcNow.ToString('o');Profile=$profile.id;Project=$projectFile;Mode=$mode;ContentFolder=$contentFolder;AssetPackage=$assetPackage;Succeeded=$false;Phase='Preflight';SourceMaterialsChanged=$false;SourceConfigChanged=$false}
     $result['RequestedPackages'] = $assetPackages
+    $stallSeconds = if ($requestData.PSObject.Properties['ShaderStallSeconds']) { [int]$requestData.ShaderStallSeconds } else { 900 }
+    if ($stallSeconds -lt 1 -or $stallSeconds -gt 7200) { throw 'ShaderStallSeconds must be between 1 and 7200.' }
+    $result['ShaderStallSeconds'] = $stallSeconds
     Status 'Checking engine and cooker files...'
     $engineBuild = Get-Content -LiteralPath (Join-Path $engineRoot 'Engine\Build\Build.version') -Raw | ConvertFrom-Json
     if ($engineBuild.MajorVersion -ne $profile.engineMajor -or $engineBuild.MinorVersion -ne $profile.engineMinor -or $engineBuild.PatchVersion -ne $profile.enginePatch -or $engineBuild.Changelist -ne $profile.engineChangelist) {
@@ -241,12 +245,12 @@ try {
             $result.Phase = 'Cooking'
             Write-Json $resultPath $result
             Status 'Cooking the saved project copy. You can continue editing the source project.'
-            $ErrorActionPreference = 'Continue'
-            & $uat @arguments 2>&1 | ForEach-Object { $line = $_.ToString(); $consoleWriter.WriteLine($line); Write-Output $line }
-            $exitCode = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 1 }
-            $ErrorActionPreference = 'Stop'
+            $exitCode = Invoke-CookWithRecovery $uat $arguments $copyProject $runFolder $PSScriptRoot $result $consoleWriter $stallSeconds
             $result['UatExitCode'] = $exitCode
-            if ($exitCode -ne 0) { throw ('UAT failed with exit code ' + $exitCode + '. See Console.txt and UATLogs.') }
+            if ($exitCode -ne 0) {
+                if ($result.Contains('ShaderWorkerFailure')) { throw ('Shader compilation stopped: ' + $result.ShaderWorkerFailure.Detail + ' See CookMonitor reports and preserved worker diagnostics.') }
+                throw ('UAT failed with exit code ' + $exitCode + '. See Console.txt and UATLogs.')
+            }
             Status 'Checking packaged files and shader-worker reports...'
             $consoleWriter.Flush()
             $materialWarnings = @(Get-CookMaterialWarnings (Join-Path $runFolder 'Console.txt'))

@@ -83,6 +83,12 @@ interrupted cook's remaining diagnostics are recovered into the next run's
 `Result.json` includes the reusable cook project path, copied/reused file counts,
 corrected job count, cleanup warnings and packaged file hashes.
 Material compilation warnings are listed there even when UAT returns success.
+
+If a shader batch goes 15 minutes without a result, or Unreal reports a worker
+exiting without its result, I save the diagnostics and retry once with lower
+parallelism. This can be slower. A second stall stops the cook. See
+`CookMonitor-attempt-*.json` and `StalledAttempt1` in the output folder.
+
 The cook report lists the cooked `/Game` packages and checks that selected
 packages were included. A successful engine-only build is not accepted as a mod.
 The source materials and configuration are left as authored. A missing native
