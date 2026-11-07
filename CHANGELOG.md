@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.2.0
 
 - Added **Arena map** mode and a **Cook as an arena** option. Arena cooks keep
   property tags and apply the shader corrections.
