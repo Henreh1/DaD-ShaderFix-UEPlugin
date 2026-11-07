@@ -48,14 +48,24 @@ respecting never-cook rules. These modes do not override other
 always-cook folders or force all assets into a new chunk. Check the chunks you
 normally distribute.
 
-I save the project before preparing a separate cook copy. Copying the project
-keeps assets available for dependency resolution; it does not select every asset
-for cooking. Once the status says it is cooking, you can keep editing the source
-project. The cooking status cycles its dots while the cook process is running.
+I save the project before refreshing one separate working copy per project.
+Unchanged files are reused; changed and added files are copied, and files removed
+from the source are removed from the working copy. The copy keeps assets available
+for dependency resolution; it does not select every asset for cooking. Once the
+status says it is cooking, you can keep editing the source project. The cooking
+status cycles its dots while the cook process is running.
 Normal editor previews and normal packaging keep using their existing compiler
 and cache. The copy
 uses a private shader cache and NullRHI, so corrected shaders stay out of the
 stock renderer and shared cache.
+
+Working copies live under `LimelightSC/Projects` in the Windows temporary folder.
+The cooker checks its ownership marker and holds a per-project lock before
+refreshing or cleaning a copy. It refuses linked workspace paths. Old cooked,
+staged and intermediate data is cleared before reuse and after a successful cook.
+The private DDC is reused separately, with Unreal's cleanup of entries unused for
+14 days enabled. It can still be large for large projects. Working copies from
+older versions under `LimelightSC/Runs` are not automatically adopted or deleted.
 
 This version corrects the known `TranslucentBasePass` and `OpaqueBasePass`
 layouts. The opaque correction keeps the material's existing DBuffer decal
@@ -64,8 +74,14 @@ guessed shader. The cooker retains stock shader logic while aligning the two
 known resource layouts.
 
 `Console.txt`, `UATLogs` and `Result.json` are saved with each run. Enable **Save
-shader debug files** if you need compiler diagnostics. `Result.json` includes
-the temporary cook project path, corrected job count, and packaged file hashes.
+shader debug files** if you need compiler diagnostics. Normal cooks discard
+completed shader batch captures; debug-enabled cooks retain corrected batches,
+and failed batches are retained. Worker logs, cook metadata and requested debug
+files are moved into that run's output folder before scratch cleanup. An
+interrupted cook's remaining diagnostics are recovered into the next run's
+`PreviousCookDiagnostics` folder. Packaged outputs are kept per run.
+`Result.json` includes the reusable cook project path, copied/reused file counts,
+corrected job count, cleanup warnings and packaged file hashes.
 Material compilation warnings are listed there even when UAT returns success.
 The cook report lists the cooked `/Game` packages and checks that selected
 packages were included. A successful engine-only build is not accepted as a mod.

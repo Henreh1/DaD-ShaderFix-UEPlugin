@@ -223,7 +223,9 @@ public:
                 {
                     const TArray<TSharedPtr<FJsonValue>>* Warnings = nullptr;
                     const bool bHasWarnings = Result->TryGetArrayField(TEXT("MaterialWarnings"), Warnings) && Warnings && !Warnings->IsEmpty();
-                    Status = bHasWarnings ? TEXT("Cook completed with material warnings. Check Result.json before distributing the mod.") : TEXT("Cook completed. Open the output folder for packaged files and the cook report.");
+                    FString StorageWarning;
+                    Result->TryGetStringField(TEXT("StorageWarning"), StorageWarning);
+                    Status = !StorageWarning.IsEmpty() ? TEXT("Cook completed, but temporary cleanup failed. Check Result.json before the next cook.") : bHasWarnings ? TEXT("Cook completed with material warnings. Check Result.json before distributing the mod.") : TEXT("Cook completed. Open the output folder for packaged files and the cook report.");
                 }
                 else Fail(TEXT("The cook helper did not report a successful package. Check Result.json."));
             }

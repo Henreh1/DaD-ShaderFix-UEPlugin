@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Text.Json;
 
-internal sealed record AdapterSettings(string ProjectRoot, string ProjectFile, string Python, string AdapterScript, string AdapterScriptSha256, string NativeWorker, string NativeWorkerSha256, string CookToken);
+internal sealed record AdapterSettings(string ProjectRoot, string ProjectFile, string Python, string AdapterScript, string AdapterScriptSha256, string NativeWorker, string NativeWorkerSha256, string CookToken, bool KeepShaderDebug = false);
 
 internal static class Program
 {
@@ -136,8 +136,8 @@ internal static class Program
                 var temporaryOutput = output + ".adapter-" + Environment.ProcessId;
                 await File.WriteAllBytesAsync(temporaryOutput, nativeBytes);
                 File.Move(temporaryOutput, output, overwrite: true);
-                Record(new { action = "completed", batch, changed, outputBytes = nativeBytes.Length, evidence = changed > 0 ? job : null });
-                if (changed == 0)
+                Record(new { action = "completed", batch, changed, outputBytes = nativeBytes.Length, evidence = changed > 0 && settings.KeepShaderDebug ? job : null });
+                if (changed == 0 || !settings.KeepShaderDebug)
                 {
                     var resolvedJob = Canonical(job);
                     if (!Under(resolvedJob, workRoot) || (File.GetAttributes(resolvedJob) & FileAttributes.ReparsePoint) != 0) throw new IOException("Unsafe worker cleanup path.");

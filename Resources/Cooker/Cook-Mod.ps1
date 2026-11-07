@@ -14,6 +14,7 @@ $mutexHeld = $false
 $result = $null
 $resultPath = $null
 $exitCode = 1
+$workspaceReady = $false
 
 function Status([string]$Text) {
     Write-Output ('LIMELIGHT_STATUS ' + $Text)
@@ -44,28 +45,10 @@ function Write-Json([string]$Path, $Value) {
     [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 14), $script:utf8)
 }
 
-function Copy-ProjectDirectory([string]$Source, [string]$Destination) {
-    if ((Get-Item -LiteralPath $Source -Force).LinkType -in @('SymbolicLink','Junction')) { throw ('Linked project directories need a physical copy for this cook: ' + $Source) }
-    [void][IO.Directory]::CreateDirectory($Destination)
-    foreach ($item in Get-ChildItem -LiteralPath $Source -Force) {
-        if ($item.PSIsContainer) {
-            if ($item.Name -in @('Saved','Intermediate','DerivedDataCache','.git','.vs','.idea')) { continue }
-            if ($item.FullName -eq (Join-Path $script:sourceRoot 'Plugins\LimelightShaderCooker')) { continue }
-            if ($item.LinkType -in @('SymbolicLink','Junction')) { throw ('Linked project directories need a physical copy for this cook: ' + $item.FullName) }
-            Copy-ProjectDirectory $item.FullName (Join-Path $Destination $item.Name)
-        } else {
-            if ($item.LinkType -eq 'SymbolicLink') { throw ('Linked project files need a physical copy for this cook: ' + $item.FullName) }
-            $target = Join-Path $Destination $item.Name
-            [IO.File]::Copy($item.FullName, $target, $false)
-            if ((Digest $item.FullName) -ne (Digest $target)) { throw ('A source file changed while making the cook copy: ' + $item.FullName) }
-            $script:copiedFiles++
-        }
-    }
-}
-
 try {
     . (Join-Path $PSScriptRoot 'Native-Build.ps1')
     . (Join-Path $PSScriptRoot 'Cook-Results.ps1')
+    . (Join-Path $PSScriptRoot 'Workspace.ps1')
     $requestData = Get-Content -LiteralPath $Request -Raw -Encoding UTF8 | ConvertFrom-Json
     $profile = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'profile.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     $projectFile = Canonical $requestData.Project
@@ -145,9 +128,15 @@ try {
     finally { $fingerprintAlgorithm.Dispose() }
     $cacheRoot = Join-Path $workRoot ('Cache\' + $profileFingerprint)
     if ($cacheRoot.Length -ge 119) { throw 'The private shader cache path is too long. Choose a shorter WorkRoot.' }
-    $copyRoot = Join-Path $workRoot ('Runs\' + $runId)
+    if ($cacheRoot -eq $sourceRoot -or (Under $cacheRoot $sourceRoot) -or (Under $sourceRoot $cacheRoot) -or $cacheRoot -eq $engineRoot -or (Under $cacheRoot $engineRoot)) { throw 'The private cache must be separate from the source project and engine.' }
+    Assert-PhysicalWorkspacePath $cacheRoot
+    $projectHash = [Security.Cryptography.SHA256]::Create()
+    try { $projectKey = [BitConverter]::ToString($projectHash.ComputeHash([Text.Encoding]::UTF8.GetBytes($projectFile.ToLowerInvariant()))).Replace('-','').Substring(0,24) }
+    finally { $projectHash.Dispose() }
+    $copyRoot = Join-Path $workRoot ('Projects\' + $projectKey)
     if ($copyRoot -eq $sourceRoot -or (Under $copyRoot $sourceRoot) -or (Under $sourceRoot $copyRoot) -or (Under $copyRoot $engineRoot)) { throw 'The cook workspace must be separate from the source project and engine.' }
-    if (Test-Path -LiteralPath $copyRoot) { throw 'The cook workspace already exists; refusing to reuse it.' }
+    if ($outputRoot -eq $copyRoot -or (Under $outputRoot $copyRoot)) { throw 'Choose an output folder outside the reusable cook workspace.' }
+    Assert-PhysicalWorkspacePath $copyRoot
     if (Test-Path -LiteralPath (Join-Path $sourceRoot 'Binaries\Win64\ShaderCompileWorker.exe')) { throw 'This project already overrides ShaderCompileWorker. Use its original project or a clean project copy.' }
     if ($ValidateOnly) {
         $result.Phase = 'Validated'
@@ -155,7 +144,6 @@ try {
         $result['PrivateCache'] = $cacheRoot
         $exitCode = 0
     } else {
-        $projectKey = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($projectFile.ToLowerInvariant()))).Replace('-','').Substring(0,24)
         $projectMutex = New-Object Threading.Mutex($false, ('Local\LimelightShaderCooker.' + $projectKey))
         try { $mutexHeld = $projectMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $mutexHeld = $true }
         if (!$mutexHeld) { throw 'Another compatibility cook is already using this project.' }
@@ -176,14 +164,23 @@ try {
             Status 'Development game binaries are ready.'
         }
         Status 'Preparing a project copy. Please leave source assets unchanged until cooking starts...'
-        [void][IO.Directory]::CreateDirectory($copyRoot)
+        $result['WorkspaceReused'] = Initialize-CookWorkspace $copyRoot $projectFile
+        $workspaceReady = $true
+        Save-WorkspaceDiagnostics (Join-Path $runFolder 'PreviousCookDiagnostics') $true ([IO.Path]::GetFileNameWithoutExtension($projectFile))
+        Reset-CookWorkspace
         $script:copiedFiles = 0
-        foreach ($folder in @('Config','Content','Source','Build','Binaries','Plugins')) {
+        $script:reusedFiles = 0
+        $script:removedItems = 0
+        $projectFolders = @('Config','Content','Source','Build','Binaries','Plugins')
+        foreach ($item in Get-ChildItem -LiteralPath $copyRoot -Force) {
+            if ($item.Name -notin ($projectFolders + @('.limelight-workspace.json', [IO.Path]::GetFileName($projectFile)))) { Remove-WorkspaceItem $item.FullName }
+        }
+        foreach ($folder in $projectFolders) {
             $sourceFolder = Join-Path $sourceRoot $folder
-            if (Test-Path -LiteralPath $sourceFolder -PathType Container) { Copy-ProjectDirectory $sourceFolder (Join-Path $copyRoot $folder) }
+            Sync-WorkspaceDirectory $sourceFolder (Join-Path $copyRoot $folder)
         }
         $copyProject = Join-Path $copyRoot ([IO.Path]::GetFileName($projectFile))
-        [IO.File]::Copy($projectFile, $copyProject, $false)
+        Sync-WorkspaceFile $projectFile $copyProject
         $projectJson = Get-Content -LiteralPath $copyProject -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($projectJson.PSObject.Properties['Plugins']) { $projectJson.Plugins = @($projectJson.Plugins | Where-Object { $_.Name -ne 'LimelightShaderCooker' }) }
         Write-Json $copyProject $projectJson
@@ -191,7 +188,7 @@ try {
         $enginePak = Join-Path $engineRoot 'Engine\DerivedDataCache\Compressed.ddp'
         $graph = "`r`n`r`n[$cacheName]`r`nRoot=(Type=KeyLength, Length=120, Inner=AsyncPut)`r`nAsyncPut=(Type=AsyncPut, Inner=Hierarchy)`r`n"
         $graph += if (Test-Path -LiteralPath $enginePak) { "Hierarchy=(Type=Hierarchical, Inner=EnginePak, Inner=Local)`r`n" } else { "Hierarchy=(Type=Hierarchical, Inner=Local)`r`n" }
-        $graph += 'Local=(Type=FileSystem, ReadOnly=false, Clean=false, Flush=false, DeleteUnused=false, Path="' + $cacheRoot.Replace('\','/') + '")' + "`r`n"
+        $graph += 'Local=(Type=FileSystem, ReadOnly=false, Clean=true, Flush=false, DeleteUnused=true, UnusedFileAge=14, FoldersToClean=10, Path="' + $cacheRoot.Replace('\','/') + '")' + "`r`n"
         if (Test-Path -LiteralPath $enginePak) { $graph += 'EnginePak=(Type=ReadPak, Filename="' + $enginePak.Replace('\','/') + '", Compressed=true)' + "`r`n" }
         $graph += "`r`n[DevOptions.Shaders]`r`nbUseShaderCompilerFromLaunchDir=False`r`nbAllowCompilingThroughWorkers=True`r`n"
         [void][IO.Directory]::CreateDirectory((Join-Path $copyRoot 'Config'))
@@ -208,10 +205,12 @@ try {
         [void][IO.Directory]::CreateDirectory($binaryRoot)
         foreach ($file in $workerFiles) { [IO.File]::Copy((Join-Path (Join-Path $PSScriptRoot 'Worker') $file), (Join-Path $binaryRoot $file), $false) }
         $cookToken = [guid]::NewGuid().ToString('N')
-        $settings = [ordered]@{ProjectRoot=$copyRoot;ProjectFile=$copyProject;Python=$python;AdapterScript=$adapterPath;AdapterScriptSha256=$adapterHash;NativeWorker=$nativeWorker;NativeWorkerSha256=$profile.nativeWorkerSha256;CookToken=$cookToken}
+        $settings = [ordered]@{ProjectRoot=$copyRoot;ProjectFile=$copyProject;Python=$python;AdapterScript=$adapterPath;AdapterScriptSha256=$adapterHash;NativeWorker=$nativeWorker;NativeWorkerSha256=$profile.nativeWorkerSha256;CookToken=$cookToken;KeepShaderDebug=[bool]$requestData.ShaderDebug}
         Write-Json (Join-Path $binaryRoot 'ShaderAdapter.json') $settings
         $result['CookProject'] = $copyProject
         $result['CopiedFiles'] = $copiedFiles
+        $result['ReusedFiles'] = $reusedFiles
+        $result['RemovedWorkspaceItems'] = $removedItems
         $result['PrivateCache'] = $cacheRoot
         $result['NullRhi'] = $true
         $result.Phase = 'Prepared'
@@ -288,6 +287,16 @@ try {
     if ($result) { $result['Error'] = $message; $result.Phase = 'Failed' }
     Status ('Cook failed: ' + $message)
 } finally {
+    if ($workspaceReady -and $mutexHeld -and !$PrepareOnly) {
+        try {
+            Save-WorkspaceDiagnostics $runFolder ([bool]$requestData.ShaderDebug -or !$result.Succeeded) ([IO.Path]::GetFileNameWithoutExtension($projectFile))
+            $result['DiagnosticsSavedToOutput'] = $true
+            if ($result.Succeeded) { Reset-CookWorkspace; $result['CookScratchRemoved'] = $true }
+        } catch {
+            $result['StorageWarning'] = $_.Exception.Message
+            Status ('Cook workspace cleanup needs attention: ' + $_.Exception.Message)
+        }
+    }
     if ($result -and $resultPath) { $result['FinishedUtc'] = [datetime]::UtcNow.ToString('o'); $result['ExitCode'] = $exitCode; Write-Json $resultPath $result }
     if ($consoleWriter) { $consoleWriter.Dispose() }
     if ($mutexHeld) { $projectMutex.ReleaseMutex() }
