@@ -4,11 +4,15 @@
 
 - The cooker now reuses one working copy per project and syncs changed files
   before each cook. The first cook still needs to make a copy.
-- The plugin window follows the live UAT log, shows shader progress when UAT
-  is quiet, and keeps an elapsed timer that stops when the cook ends.
-- The cook status shows completed shader jobs and batches and, when available,
-  how many shader jobs are still queued or running. That count can rise as
-  Unreal discovers more work.
+- Fixed the text alignment on the **Cook Mod**, **Cancel**, and
+  **Open output folder** buttons.
+- Fixed the in-editor console log getting stuck at sandbox cleanup. It now
+  follows the live UAT log and shows shader progress when UAT is quiet.
+- Added **Jobs remaining now** alongside completed shader jobs and batches.
+  When available, it counts queued and running jobs and can rise as Unreal
+  discovers more work.
+- The elapsed timer updates independently of the log and stops when the cook
+  ends.
 - If a shader batch goes 15 minutes without a result, or Unreal reports that a
   worker exited without returning one, the cooker saves diagnostics and retries
   once with lower parallelism. A second stall stops the cook and leaves logs
