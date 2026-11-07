@@ -1,0 +1,18 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1.0",
+  "FriendlyName": "Limelight Cook Progress",
+  "CanContainContent": false,
+  "EnabledByDefault": false,
+  "Installed": true,
+  "SupportedTargetPlatforms": ["Win64"],
+  "Modules": [
+    {
+      "Name": "LimelightCookProgress",
+      "Type": "Editor",
+      "LoadingPhase": "PostEngineInit",
+      "PlatformAllowList": ["Win64"]
+    }
+  ]
+}

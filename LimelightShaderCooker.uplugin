@@ -17,6 +17,12 @@
       "Type": "EditorNoCommandlet",
       "LoadingPhase": "Default",
       "PlatformAllowList": ["Win64"]
+    },
+    {
+      "Name": "LimelightCookProgress",
+      "Type": "EditorNoCommandlet",
+      "LoadingPhase": "PostEngineInit",
+      "PlatformAllowList": ["Win64"]
     }
   ]
 }

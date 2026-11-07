@@ -35,4 +35,14 @@ $buildRoot = Join-Path $buildBase ('sc-' + [guid]::NewGuid().ToString('N').Subst
 & (Join-Path $EngineRoot 'Engine\Build\BatchFiles\RunUAT.bat') BuildPlugin ('-Plugin=' + (Join-Path $pluginRoot 'LimelightShaderCooker.uplugin')) ('-Package=' + $buildRoot) '-TargetPlatforms=Win64' '-NoP4' '-UTF8Output'
 if ($LASTEXITCODE -ne 0) { throw ('Editor plugin build failed: ' + $LASTEXITCODE) }
 Copy-Item -LiteralPath $buildRoot -Destination $OutputFolder -Recurse
+$moduleManifest = Get-Content -LiteralPath (Join-Path $OutputFolder 'Binaries\Win64\UnrealEditor.modules') -Raw | ConvertFrom-Json
+$probeBinary = [string]$moduleManifest.Modules.LimelightCookProgress
+if ([IO.Path]::GetFileName($probeBinary) -ne $probeBinary -or !$probeBinary) { throw 'The cook progress module was not built.' }
+$probeManifest = [ordered]@{BuildId=$moduleManifest.BuildId;Modules=[ordered]@{LimelightCookProgress=$probeBinary}}
+foreach ($base in @($OutputFolder,$pluginRoot)) {
+    $probeRoot = Join-Path $base 'Resources\Cooker\ProgressProbe\Binaries\Win64'
+    [void][IO.Directory]::CreateDirectory($probeRoot)
+    Copy-Item -LiteralPath (Join-Path $OutputFolder ('Binaries\Win64\' + $probeBinary)) -Destination (Join-Path $probeRoot $probeBinary) -Force
+    [IO.File]::WriteAllText((Join-Path $probeRoot 'UnrealEditor.modules'), ($probeManifest | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding($false)))
+}
 Write-Output ('Plugin built: ' + $OutputFolder)

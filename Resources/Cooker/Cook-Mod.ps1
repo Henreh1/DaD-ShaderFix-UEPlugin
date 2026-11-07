@@ -121,7 +121,9 @@ try {
     $dotnet = @(Get-ChildItem -LiteralPath (Join-Path $engineRoot 'Engine\Binaries\ThirdParty\DotNet') -Filter dotnet.exe -Recurse -File | Where-Object { $_.FullName -match '\\8\.[^\\]+\\win-x64\\dotnet.exe$' })
     if (!$dotnet.Count) { throw 'The engine bundled .NET 8 runtime was not found.' }
     $workerFiles = @('ShaderCompileWorker.exe','ShaderCompileWorker.dll','ShaderCompileWorker.deps.json','ShaderCompileWorker.runtimeconfig.json')
-    foreach ($file in @($python,$oodle,$uat) + @($workerFiles | ForEach-Object { Join-Path (Join-Path $PSScriptRoot 'Worker') $_ })) {
+    $progressPayload = Join-Path $PSScriptRoot 'ProgressProbe'
+    $progressFiles = @('LimelightCookProgress.uplugin','Binaries\Win64\UnrealEditor-LimelightCookProgress.dll','Binaries\Win64\UnrealEditor.modules')
+    foreach ($file in @($python,$oodle,$uat) + @($workerFiles | ForEach-Object { Join-Path (Join-Path $PSScriptRoot 'Worker') $_ }) + @($progressFiles | ForEach-Object { Join-Path $progressPayload $_ })) {
         if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw ('Required cooker file missing: ' + $file) }
     }
     $adapterPath = Join-Path $PSScriptRoot 'task_adapter.py'
@@ -186,8 +188,16 @@ try {
         $copyProject = Join-Path $copyRoot ([IO.Path]::GetFileName($projectFile))
         Sync-WorkspaceFile $projectFile $copyProject
         $projectJson = Get-Content -LiteralPath $copyProject -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($projectJson.PSObject.Properties['Plugins']) { $projectJson.Plugins = @($projectJson.Plugins | Where-Object { $_.Name -ne 'LimelightShaderCooker' }) }
+        $projectPlugins = if ($projectJson.PSObject.Properties['Plugins']) { @($projectJson.Plugins | Where-Object { $_.Name -notin @('LimelightShaderCooker','LimelightCookProgress') }) } else { @() }
+        $projectPlugins = @($projectPlugins) + @([pscustomobject]@{Name='LimelightCookProgress';Enabled=$true;TargetAllowList=@('Editor')})
+        $projectJson | Add-Member -NotePropertyName Plugins -NotePropertyValue $projectPlugins -Force
         Write-Json $copyProject $projectJson
+        $probeTarget = Join-Path $copyRoot 'Plugins\LimelightCookProgress'
+        Remove-WorkspaceItem $probeTarget
+        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $probeTarget))
+        Assert-PhysicalWorkspaceTree $progressPayload
+        Copy-Item -LiteralPath $progressPayload -Destination $probeTarget -Recurse
+        $result['CookProgressEnabled'] = $true
         $cacheName = 'LimelightShaderCookerDDC'
         $enginePak = Join-Path $engineRoot 'Engine\DerivedDataCache\Compressed.ddp'
         $graph = "`r`n`r`n[$cacheName]`r`nRoot=(Type=KeyLength, Length=120, Inner=AsyncPut)`r`nAsyncPut=(Type=AsyncPut, Inner=Hierarchy)`r`n"

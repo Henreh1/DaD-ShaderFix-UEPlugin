@@ -84,6 +84,10 @@ interrupted cook's remaining diagnostics are recovered into the next run's
 corrected job count, cleanup warnings and packaged file hashes.
 Material compilation warnings are listed there even when UAT returns success.
 
+The cook status shows completed worker jobs and batches. **Jobs remaining now**
+includes queued and running jobs. It can go up as Unreal finds more materials;
+zero means the shader queue is empty, and packaging may still be running.
+
 If a shader batch goes 15 minutes without a result, or Unreal reports a worker
 exiting without its result, I save the diagnostics and retry once with lower
 parallelism. This can be slower. A second stall stops the cook. See

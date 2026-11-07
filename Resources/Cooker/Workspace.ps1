@@ -98,7 +98,7 @@ function Sync-WorkspaceDirectory([string]$Source, [string]$Target) {
 }
 
 function Save-WorkspaceDiagnostics([string]$Destination, [bool]$KeepWork, [string]$ProjectName = '') {
-    $paths = [ordered]@{'Saved\ShaderAdapter\Logs'='ShaderWorkerLogs';'Saved\Logs'='CookProjectLogs';'Saved\Crashes'='Crashes'}
+    $paths = [ordered]@{'Saved\ShaderAdapter\Logs'='ShaderWorkerLogs';'Saved\ShaderAdapter\Progress'='CookProgress';'Saved\Logs'='CookProjectLogs';'Saved\Crashes'='Crashes'}
     if ($KeepWork) {
         $paths['Saved\ShaderAdapter\Work'] = 'ShaderWorkerWork'
         $paths['Saved\ShaderDebugInfo'] = 'ShaderDebugInfo'
