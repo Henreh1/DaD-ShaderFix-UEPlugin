@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.1 (unreleased)
+## 0.2.1 
 
 - Fixed a cook startup error when an Unreal project file contains a trailing
   comma. The cooker now accepts the descriptor and leaves the original project
