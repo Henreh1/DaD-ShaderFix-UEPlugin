@@ -45,6 +45,13 @@ function Write-Json([string]$Path, $Value) {
     [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 14), $script:utf8)
 }
 
+function Read-ProjectDescriptor([string]$Path) {
+    $json = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+    # Unreal accepts trailing commas. Keep quoted strings intact for Windows PowerShell.
+    $json = [regex]::Replace($json, '("(?:[^"\\]|\\.)*")|(?<=[^,{\[\s])(\s*),(?=\s*[}\]])', '$1$2')
+    $json | ConvertFrom-Json
+}
+
 try {
     . (Join-Path $PSScriptRoot 'Native-Build.ps1')
     . (Join-Path $PSScriptRoot 'Cook-Results.ps1')
@@ -128,7 +135,7 @@ try {
     }
     $nativeWorker = Join-Path $engineRoot 'Engine\Binaries\Win64\ShaderCompileWorker.exe'
     if ((Digest $nativeWorker) -ne $profile.nativeWorkerSha256) { throw 'The engine shader worker differs from the tested compatibility profile.' }
-    $projectDescription = Get-Content -LiteralPath $projectFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    $projectDescription = Read-ProjectDescriptor $projectFile
     $needsGameBinaries = $projectDescription.PSObject.Properties['Modules'] -and @($projectDescription.Modules | Where-Object { $_.Type -in @('Runtime','RuntimeNoCommandlet','RuntimeAndProgram','ClientOnly','ClientOnlyNoCommandlet') }).Count
     $receipts = @(Get-DevelopmentGameReceipts $projectFile $engineBuild)
     $result['DevelopmentReceipts'] = $receipts
@@ -207,7 +214,7 @@ try {
         }
         $copyProject = Join-Path $copyRoot ([IO.Path]::GetFileName($projectFile))
         Sync-WorkspaceFile $projectFile $copyProject
-        $projectJson = Get-Content -LiteralPath $copyProject -Raw -Encoding UTF8 | ConvertFrom-Json
+        $projectJson = Read-ProjectDescriptor $copyProject
         $projectPlugins = if ($projectJson.PSObject.Properties['Plugins']) { @($projectJson.Plugins | Where-Object { $_.Name -notin @('LimelightShaderCooker','LimelightCookProgress') }) } else { @() }
         $projectPlugins = @($projectPlugins) + @([pscustomobject]@{Name='LimelightCookProgress';Enabled=$true;TargetAllowList=@('Editor')})
         $projectJson | Add-Member -NotePropertyName Plugins -NotePropertyValue $projectPlugins -Force

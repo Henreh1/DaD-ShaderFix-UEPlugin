@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 (unreleased)
+
+- Fixed a cook startup error when an Unreal project file contains a trailing
+  comma. The cooker now accepts the descriptor and leaves the original project
+  file untouched.
+
 ## 0.2.0
 
 - Added **Arena map** mode and a **Cook as an arena** option. Arena cooks keep
