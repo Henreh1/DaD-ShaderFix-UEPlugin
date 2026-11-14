@@ -1,10 +1,10 @@
 {
   "FileVersion": 3,
-  "Version": 3,
-  "VersionName": "0.2.1",
+  "Version": 4,
+  "VersionName": "0.3.0",
   "EngineVersion": "5.7.4",
   "FriendlyName": "Limelight Shader Cooker",
-  "Description": "Cook Dead as Disco mods with the CL-35029 base-pass shader layouts.",
+  "Description": "Cook Dead as Disco mods directly from the current Unreal project.",
   "Category": "Editor",
   "CreatedBy": "Henry",
   "CanContainContent": false,
@@ -20,7 +20,7 @@
     },
     {
       "Name": "LimelightCookProgress",
-      "Type": "EditorNoCommandlet",
+      "Type": "Editor",
       "LoadingPhase": "PostEngineInit",
       "PlatformAllowList": ["Win64"]
     }

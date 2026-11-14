@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory=$true)][string]$Request,
     [switch]$ValidateOnly,
-    [switch]$PrepareOnly
+    [switch]$PrepareOnly,
+    [switch]$StockCook
 )
 
 $ErrorActionPreference = 'Stop'
@@ -63,7 +64,7 @@ try {
     $sourceRoot = Split-Path -Parent $projectFile
     $engineRoot = Canonical $requestData.Engine
     $outputRoot = Canonical $requestData.OutputRoot
-    $workRoot = Canonical $requestData.WorkRoot
+    $workRoot = if (!$StockCook) { Canonical $requestData.WorkRoot }
     $runId = [string]$requestData.RunId
     if ($runId -notmatch '^\d{8}-\d{6}-[a-f0-9]{8}$') { throw 'Invalid cook run identifier.' }
     if (!(Test-Path -LiteralPath $projectFile -PathType Leaf) -or [IO.Path]::GetExtension($projectFile) -ne '.uproject') { throw 'The selected .uproject does not exist.' }
@@ -120,7 +121,8 @@ try {
     $resultPath = Join-Path $runFolder 'Result.json'
     $consoleWriter = New-Object IO.StreamWriter((Join-Path $runFolder 'Console.txt'), $false, $utf8)
     $consoleWriter.AutoFlush = $true
-    $result = [ordered]@{RunId=$runId;StartedUtc=[datetime]::UtcNow.ToString('o');Profile=$profile.id;Project=$projectFile;Mode=$mode;ContentFolder=$contentFolder;AssetPackage=$assetPackage;Succeeded=$false;Phase='Preflight';SourceMaterialsChanged=$false;SourceConfigChanged=$false}
+    $profileId = if ($StockCook) { 'stock-ue' } else { $profile.id }
+    $result = [ordered]@{RunId=$runId;StartedUtc=[datetime]::UtcNow.ToString('o');Profile=$profileId;Project=$projectFile;Mode=$mode;ContentFolder=$contentFolder;AssetPackage=$assetPackage;Succeeded=$false;Phase='Preflight';SourceMaterialsChanged=$false;SourceConfigChanged=$false}
     $result['RequestedPackages'] = $requestedPackages
     $result['RequestedMaps'] = $mapPackages
     $result['ArenaCook'] = [bool]$arenaCook
@@ -131,10 +133,10 @@ try {
     Status 'Checking engine and cooker files...'
     $engineBuild = Get-Content -LiteralPath (Join-Path $engineRoot 'Engine\Build\Build.version') -Raw | ConvertFrom-Json
     if ($engineBuild.MajorVersion -ne $profile.engineMajor -or $engineBuild.MinorVersion -ne $profile.engineMinor -or $engineBuild.PatchVersion -ne $profile.enginePatch -or $engineBuild.Changelist -ne $profile.engineChangelist) {
-        throw 'This compatibility profile requires the tested Epic UE 5.7.4 engine (CL-51494982).'
+        throw 'The cooker requires the tested Epic UE 5.7.4 engine (CL-51494982).'
     }
-    $nativeWorker = Join-Path $engineRoot 'Engine\Binaries\Win64\ShaderCompileWorker.exe'
-    if ((Digest $nativeWorker) -ne $profile.nativeWorkerSha256) { throw 'The engine shader worker differs from the tested compatibility profile.' }
+    $uat = Join-Path $engineRoot 'Engine\Build\BatchFiles\RunUAT.bat'
+    if (!(Test-Path -LiteralPath $uat -PathType Leaf)) { throw ('Required cooker file missing: ' + $uat) }
     $projectDescription = Read-ProjectDescriptor $projectFile
     $needsGameBinaries = $projectDescription.PSObject.Properties['Modules'] -and @($projectDescription.Modules | Where-Object { $_.Type -in @('Runtime','RuntimeNoCommandlet','RuntimeAndProgram','ClientOnly','ClientOnlyNoCommandlet') }).Count
     $receipts = @(Get-DevelopmentGameReceipts $projectFile $engineBuild)
@@ -142,44 +144,54 @@ try {
     $result['NativeBuildRequired'] = [bool]($needsGameBinaries -and !$receipts.Count)
     $result['NativeBuildStarted'] = $false
     if ($result.NativeBuildRequired) { $result['NativeBuildArguments'] = @(Get-DevelopmentBuildArguments $projectFile) }
-    $python = Join-Path $engineRoot 'Engine\Binaries\ThirdParty\Python3\Win64\python.exe'
-    $oodle = Join-Path $engineRoot 'Engine\Binaries\DotNET\AutomationTool\oo2core_9_win64.dll'
-    $uat = Join-Path $engineRoot 'Engine\Build\BatchFiles\RunUAT.bat'
-    $dotnet = @(Get-ChildItem -LiteralPath (Join-Path $engineRoot 'Engine\Binaries\ThirdParty\DotNet') -Filter dotnet.exe -Recurse -File | Where-Object { $_.FullName -match '\\8\.[^\\]+\\win-x64\\dotnet.exe$' })
-    if (!$dotnet.Count) { throw 'The engine bundled .NET 8 runtime was not found.' }
-    $workerFiles = @('ShaderCompileWorker.exe','ShaderCompileWorker.dll','ShaderCompileWorker.deps.json','ShaderCompileWorker.runtimeconfig.json')
-    $progressPayload = Join-Path $PSScriptRoot 'ProgressProbe'
-    $progressFiles = @('LimelightCookProgress.uplugin','Binaries\Win64\UnrealEditor-LimelightCookProgress.dll','Binaries\Win64\UnrealEditor.modules')
-    foreach ($file in @($python,$oodle,$uat) + @($workerFiles | ForEach-Object { Join-Path (Join-Path $PSScriptRoot 'Worker') $_ }) + @($progressFiles | ForEach-Object { Join-Path $progressPayload $_ })) {
-        if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw ('Required cooker file missing: ' + $file) }
-    }
-    $adapterPath = Join-Path $PSScriptRoot 'task_adapter.py'
-    $adapterHash = Digest $adapterPath
-    $fingerprintInput = $adapterHash + (Digest (Join-Path $PSScriptRoot 'format-versions.json')) + (Digest (Join-Path $PSScriptRoot 'translucent-layout.json')) + (Digest (Join-Path $PSScriptRoot 'opaque-layout.json')) + (Digest (Join-Path $PSScriptRoot 'profile.json')) + (Digest (Join-Path $PSScriptRoot 'Worker\ShaderCompileWorker.dll'))
-    $fingerprintAlgorithm = [Security.Cryptography.SHA256]::Create()
-    try { $profileFingerprint = [BitConverter]::ToString($fingerprintAlgorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes($fingerprintInput))).Replace('-','').ToLowerInvariant().Substring(0,24) }
-    finally { $fingerprintAlgorithm.Dispose() }
-    $cacheRoot = Join-Path $workRoot ('Cache\' + $profileFingerprint)
-    if ($cacheRoot.Length -ge 119) { throw 'The private shader cache path is too long. Choose a shorter WorkRoot.' }
-    if ($cacheRoot -eq $sourceRoot -or (Under $cacheRoot $sourceRoot) -or (Under $sourceRoot $cacheRoot) -or $cacheRoot -eq $engineRoot -or (Under $cacheRoot $engineRoot)) { throw 'The private cache must be separate from the source project and engine.' }
-    Assert-PhysicalWorkspacePath $cacheRoot
     $projectHash = [Security.Cryptography.SHA256]::Create()
     try { $projectKey = [BitConverter]::ToString($projectHash.ComputeHash([Text.Encoding]::UTF8.GetBytes($projectFile.ToLowerInvariant()))).Replace('-','').Substring(0,24) }
     finally { $projectHash.Dispose() }
-    $copyRoot = Join-Path $workRoot ('Projects\' + $projectKey)
-    if ($copyRoot -eq $sourceRoot -or (Under $copyRoot $sourceRoot) -or (Under $sourceRoot $copyRoot) -or (Under $copyRoot $engineRoot)) { throw 'The cook workspace must be separate from the source project and engine.' }
-    if ($outputRoot -eq $copyRoot -or (Under $outputRoot $copyRoot)) { throw 'Choose an output folder outside the reusable cook workspace.' }
-    Assert-PhysicalWorkspacePath $copyRoot
-    if (Test-Path -LiteralPath (Join-Path $sourceRoot 'Binaries\Win64\ShaderCompileWorker.exe')) { throw 'This project already overrides ShaderCompileWorker. Use its original project or a clean project copy.' }
+    $cookProject = $projectFile
+    $cookedOutput = Join-Path $runFolder 'Cooked\Windows'
+    if (!$StockCook) {
+        $nativeWorker = Join-Path $engineRoot 'Engine\Binaries\Win64\ShaderCompileWorker.exe'
+        if ((Digest $nativeWorker) -ne $profile.nativeWorkerSha256) { throw 'The engine shader worker differs from the tested compatibility profile.' }
+        $python = Join-Path $engineRoot 'Engine\Binaries\ThirdParty\Python3\Win64\python.exe'
+        $oodle = Join-Path $engineRoot 'Engine\Binaries\DotNET\AutomationTool\oo2core_9_win64.dll'
+        $dotnet = @(Get-ChildItem -LiteralPath (Join-Path $engineRoot 'Engine\Binaries\ThirdParty\DotNet') -Filter dotnet.exe -Recurse -File | Where-Object { $_.FullName -match '\\8\.[^\\]+\\win-x64\\dotnet.exe$' })
+        if (!$dotnet.Count) { throw 'The engine bundled .NET 8 runtime was not found.' }
+        $workerFiles = @('ShaderCompileWorker.exe','ShaderCompileWorker.dll','ShaderCompileWorker.deps.json','ShaderCompileWorker.runtimeconfig.json')
+        $progressPayload = Join-Path $PSScriptRoot 'ProgressProbe'
+        $progressFiles = @('LimelightCookProgress.uplugin','Binaries\Win64\UnrealEditor-LimelightCookProgress.dll','Binaries\Win64\UnrealEditor.modules')
+        foreach ($file in @($python,$oodle,$uat) + @($workerFiles | ForEach-Object { Join-Path (Join-Path $PSScriptRoot 'Worker') $_ }) + @($progressFiles | ForEach-Object { Join-Path $progressPayload $_ })) {
+            if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw ('Required cooker file missing: ' + $file) }
+        }
+        $adapterPath = Join-Path $PSScriptRoot 'task_adapter.py'
+        $adapterHash = Digest $adapterPath
+        $fingerprintInput = $adapterHash + (Digest (Join-Path $PSScriptRoot 'format-versions.json')) + (Digest (Join-Path $PSScriptRoot 'translucent-layout.json')) + (Digest (Join-Path $PSScriptRoot 'opaque-layout.json')) + (Digest (Join-Path $PSScriptRoot 'profile.json')) + (Digest (Join-Path $PSScriptRoot 'Worker\ShaderCompileWorker.dll'))
+        $fingerprintAlgorithm = [Security.Cryptography.SHA256]::Create()
+        try { $profileFingerprint = [BitConverter]::ToString($fingerprintAlgorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes($fingerprintInput))).Replace('-','').ToLowerInvariant().Substring(0,24) }
+        finally { $fingerprintAlgorithm.Dispose() }
+        $cacheRoot = Join-Path $workRoot ('Cache\' + $profileFingerprint)
+        if ($cacheRoot.Length -ge 119) { throw 'The private shader cache path is too long. Choose a shorter WorkRoot.' }
+        if ($cacheRoot -eq $sourceRoot -or (Under $cacheRoot $sourceRoot) -or (Under $sourceRoot $cacheRoot) -or $cacheRoot -eq $engineRoot -or (Under $cacheRoot $engineRoot)) { throw 'The private cache must be separate from the source project and engine.' }
+        Assert-PhysicalWorkspacePath $cacheRoot
+        $copyRoot = Join-Path $workRoot ('Projects\' + $projectKey)
+        if ($copyRoot -eq $sourceRoot -or (Under $copyRoot $sourceRoot) -or (Under $sourceRoot $copyRoot) -or (Under $copyRoot $engineRoot)) { throw 'The cook workspace must be separate from the source project and engine.' }
+        if ($outputRoot -eq $copyRoot -or (Under $outputRoot $copyRoot)) { throw 'Choose an output folder outside the reusable cook workspace.' }
+        Assert-PhysicalWorkspacePath $copyRoot
+        if (Test-Path -LiteralPath (Join-Path $sourceRoot 'Binaries\Win64\ShaderCompileWorker.exe')) { throw 'This project already overrides ShaderCompileWorker. Use its original project or a clean project copy.' }
+    } elseif (Test-Path -LiteralPath (Join-Path $sourceRoot 'Binaries\Win64\ShaderCompileWorker.exe')) {
+        throw 'This project overrides ShaderCompileWorker. Choose a project that uses the stock shader compiler.'
+    }
     if ($ValidateOnly) {
         $result.Phase = 'Validated'
         $result['StartsCook'] = $false
-        $result['PrivateCache'] = $cacheRoot
+        if (!$StockCook) { $result['PrivateCache'] = $cacheRoot }
         $exitCode = 0
     } else {
         $projectMutex = New-Object Threading.Mutex($false, ('Local\LimelightShaderCooker.' + $projectKey))
         try { $mutexHeld = $projectMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $mutexHeld = $true }
-        if (!$mutexHeld) { throw 'Another compatibility cook is already using this project.' }
+        if (!$mutexHeld) {
+            if ($StockCook) { throw 'Another cook is already using this project.' }
+            throw 'Another compatibility cook is already using this project.'
+        }
         if ($result.NativeBuildRequired -and !$PrepareOnly) {
             Status 'Building the missing Win64 Development game binaries. This step needs the Visual Studio C++ build tools and Windows SDK.'
             $result.Phase = 'BuildingDevelopment'
@@ -196,107 +208,137 @@ try {
             $result.NativeBuildRequired = $false
             Status 'Development game binaries are ready.'
         }
-        Status 'Preparing a project copy. Please leave source assets unchanged until cooking starts...'
-        $result['WorkspaceReused'] = Initialize-CookWorkspace $copyRoot $projectFile
-        $workspaceReady = $true
-        Save-WorkspaceDiagnostics (Join-Path $runFolder 'PreviousCookDiagnostics') $true ([IO.Path]::GetFileNameWithoutExtension($projectFile))
-        Reset-CookWorkspace
-        $script:copiedFiles = 0
-        $script:reusedFiles = 0
-        $script:removedItems = 0
-        $projectFolders = @('Config','Content','Source','Build','Binaries','Plugins')
-        foreach ($item in Get-ChildItem -LiteralPath $copyRoot -Force) {
-            if ($item.Name -notin ($projectFolders + @('.limelight-workspace.json', [IO.Path]::GetFileName($projectFile)))) { Remove-WorkspaceItem $item.FullName }
+        if (!$StockCook) {
+            Status 'Preparing a project copy. Please leave source assets unchanged until cooking starts...'
+            $result['WorkspaceReused'] = Initialize-CookWorkspace $copyRoot $projectFile
+            $workspaceReady = $true
+            Save-WorkspaceDiagnostics (Join-Path $runFolder 'PreviousCookDiagnostics') $true ([IO.Path]::GetFileNameWithoutExtension($projectFile))
+            Reset-CookWorkspace
+            $script:copiedFiles = 0
+            $script:reusedFiles = 0
+            $script:removedItems = 0
+            $projectFolders = @('Config','Content','Source','Build','Binaries','Plugins')
+            foreach ($item in Get-ChildItem -LiteralPath $copyRoot -Force) {
+                if ($item.Name -notin ($projectFolders + @('.limelight-workspace.json', [IO.Path]::GetFileName($projectFile)))) { Remove-WorkspaceItem $item.FullName }
+            }
+            foreach ($folder in $projectFolders) {
+                $sourceFolder = Join-Path $sourceRoot $folder
+                Sync-WorkspaceDirectory $sourceFolder (Join-Path $copyRoot $folder)
+            }
+            $copyProject = Join-Path $copyRoot ([IO.Path]::GetFileName($projectFile))
+            Sync-WorkspaceFile $projectFile $copyProject
+            $projectJson = Read-ProjectDescriptor $copyProject
+            $projectPlugins = if ($projectJson.PSObject.Properties['Plugins']) { @($projectJson.Plugins | Where-Object { $_.Name -notin @('LimelightShaderCooker','LimelightCookProgress') }) } else { @() }
+            $projectPlugins = @($projectPlugins) + @([pscustomobject]@{Name='LimelightCookProgress';Enabled=$true;TargetAllowList=@('Editor')})
+            $projectJson | Add-Member -NotePropertyName Plugins -NotePropertyValue $projectPlugins -Force
+            Write-Json $copyProject $projectJson
+            $probeTarget = Join-Path $copyRoot 'Plugins\LimelightCookProgress'
+            Remove-WorkspaceItem $probeTarget
+            [void][IO.Directory]::CreateDirectory((Split-Path -Parent $probeTarget))
+            Assert-PhysicalWorkspaceTree $progressPayload
+            Copy-Item -LiteralPath $progressPayload -Destination $probeTarget -Recurse
+            $result['CookProgressEnabled'] = $true
+            $cacheName = 'LimelightShaderCookerDDC'
+            $enginePak = Join-Path $engineRoot 'Engine\DerivedDataCache\Compressed.ddp'
+            $graph = "`r`n`r`n[$cacheName]`r`nRoot=(Type=KeyLength, Length=120, Inner=AsyncPut)`r`nAsyncPut=(Type=AsyncPut, Inner=Hierarchy)`r`n"
+            $graph += if (Test-Path -LiteralPath $enginePak) { "Hierarchy=(Type=Hierarchical, Inner=EnginePak, Inner=Local)`r`n" } else { "Hierarchy=(Type=Hierarchical, Inner=Local)`r`n" }
+            $graph += 'Local=(Type=FileSystem, ReadOnly=false, Clean=true, Flush=false, DeleteUnused=true, UnusedFileAge=14, FoldersToClean=10, Path="' + $cacheRoot.Replace('\','/') + '")' + "`r`n"
+            if (Test-Path -LiteralPath $enginePak) { $graph += 'EnginePak=(Type=ReadPak, Filename="' + $enginePak.Replace('\','/') + '", Compressed=true)' + "`r`n" }
+            $graph += "`r`n[DevOptions.Shaders]`r`nbUseShaderCompilerFromLaunchDir=False`r`nbAllowCompilingThroughWorkers=True`r`n"
+            [void][IO.Directory]::CreateDirectory((Join-Path $copyRoot 'Config'))
+            $engineIni = Join-Path $copyRoot 'Config\DefaultEngine.ini'
+            $originalConfig = if (Test-Path -LiteralPath $engineIni) { [IO.File]::ReadAllText($engineIni) } else { '' }
+            [IO.File]::WriteAllText($engineIni, $originalConfig + $graph, $utf8)
+            $gameIni = Join-Path $copyRoot 'Config\DefaultGame.ini'
+            $gameConfig = if (Test-Path -LiteralPath $gameIni) { [IO.File]::ReadAllText($gameIni) } else { '' }
+            $cookAll = if ($mode -eq 'All') { 'True' } else { 'False' }
+            $packaging = "`r`n[/Script/UnrealEd.ProjectPackagingSettings]`r`nbCookAll=$cookAll`r`n"
+            if ($mode -eq 'All') { $packaging += "bCookMapsOnly=False`r`n" }
+            [IO.File]::WriteAllText($gameIni, $gameConfig + $packaging, $utf8)
+            $binaryRoot = Join-Path $copyRoot 'Binaries\Win64'
+            [void][IO.Directory]::CreateDirectory($binaryRoot)
+            foreach ($file in $workerFiles) { [IO.File]::Copy((Join-Path (Join-Path $PSScriptRoot 'Worker') $file), (Join-Path $binaryRoot $file), $false) }
+            $cookToken = [guid]::NewGuid().ToString('N')
+            $settings = [ordered]@{ProjectRoot=$copyRoot;ProjectFile=$copyProject;Python=$python;AdapterScript=$adapterPath;AdapterScriptSha256=$adapterHash;NativeWorker=$nativeWorker;NativeWorkerSha256=$profile.nativeWorkerSha256;CookToken=$cookToken;KeepShaderDebug=[bool]$requestData.ShaderDebug}
+            Write-Json (Join-Path $binaryRoot 'ShaderAdapter.json') $settings
+            $cookProject = $copyProject
+            $cookedOutput = Join-Path $copyRoot 'Saved\Cooked\Windows'
+            $result['CopiedFiles'] = $copiedFiles
+            $result['ReusedFiles'] = $reusedFiles
+            $result['RemovedWorkspaceItems'] = $removedItems
+            $result['PrivateCache'] = $cacheRoot
+            $forceVars = 'r.ShaderCompiler.JobCacheDDC=0'
+            if ($requestData.ShaderDebug) { $forceVars += ',r.DumpShaderDebugInfo=1,r.DumpShaderDebugShortNames=1' }
+            $additionalOptions = '-NoDefaultMaps -NoMaterialShaderDDC -ForceGenerateAllChunksInfo -DDC=' + $cacheName + ' -NullRHI -ForceDPCVars=' + $forceVars
+        } else {
+            $packagingSection = '[/Script/UnrealEd.ProjectPackagingSettings]'
+            $cookAll = if ($mode -eq 'All') { 'True' } else { 'False' }
+            $additionalOptions = '-NoDefaultMaps -ForceGenerateAllChunksInfo -NullRHI -ini:Game:' + $packagingSection + ':bCookAll=' + $cookAll
+            if ($mode -eq 'All') { $additionalOptions += ',' + $packagingSection + ':bCookMapsOnly=False' }
+            if ($requestData.ShaderDebug) { $additionalOptions += ' -ForceDPCVars=r.DumpShaderDebugInfo=1,r.DumpShaderDebugShortNames=1' }
         }
-        foreach ($folder in $projectFolders) {
-            $sourceFolder = Join-Path $sourceRoot $folder
-            Sync-WorkspaceDirectory $sourceFolder (Join-Path $copyRoot $folder)
-        }
-        $copyProject = Join-Path $copyRoot ([IO.Path]::GetFileName($projectFile))
-        Sync-WorkspaceFile $projectFile $copyProject
-        $projectJson = Read-ProjectDescriptor $copyProject
-        $projectPlugins = if ($projectJson.PSObject.Properties['Plugins']) { @($projectJson.Plugins | Where-Object { $_.Name -notin @('LimelightShaderCooker','LimelightCookProgress') }) } else { @() }
-        $projectPlugins = @($projectPlugins) + @([pscustomobject]@{Name='LimelightCookProgress';Enabled=$true;TargetAllowList=@('Editor')})
-        $projectJson | Add-Member -NotePropertyName Plugins -NotePropertyValue $projectPlugins -Force
-        Write-Json $copyProject $projectJson
-        $probeTarget = Join-Path $copyRoot 'Plugins\LimelightCookProgress'
-        Remove-WorkspaceItem $probeTarget
-        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $probeTarget))
-        Assert-PhysicalWorkspaceTree $progressPayload
-        Copy-Item -LiteralPath $progressPayload -Destination $probeTarget -Recurse
-        $result['CookProgressEnabled'] = $true
-        $cacheName = 'LimelightShaderCookerDDC'
-        $enginePak = Join-Path $engineRoot 'Engine\DerivedDataCache\Compressed.ddp'
-        $graph = "`r`n`r`n[$cacheName]`r`nRoot=(Type=KeyLength, Length=120, Inner=AsyncPut)`r`nAsyncPut=(Type=AsyncPut, Inner=Hierarchy)`r`n"
-        $graph += if (Test-Path -LiteralPath $enginePak) { "Hierarchy=(Type=Hierarchical, Inner=EnginePak, Inner=Local)`r`n" } else { "Hierarchy=(Type=Hierarchical, Inner=Local)`r`n" }
-        $graph += 'Local=(Type=FileSystem, ReadOnly=false, Clean=true, Flush=false, DeleteUnused=true, UnusedFileAge=14, FoldersToClean=10, Path="' + $cacheRoot.Replace('\','/') + '")' + "`r`n"
-        if (Test-Path -LiteralPath $enginePak) { $graph += 'EnginePak=(Type=ReadPak, Filename="' + $enginePak.Replace('\','/') + '", Compressed=true)' + "`r`n" }
-        $graph += "`r`n[DevOptions.Shaders]`r`nbUseShaderCompilerFromLaunchDir=False`r`nbAllowCompilingThroughWorkers=True`r`n"
-        [void][IO.Directory]::CreateDirectory((Join-Path $copyRoot 'Config'))
-        $engineIni = Join-Path $copyRoot 'Config\DefaultEngine.ini'
-        $originalConfig = if (Test-Path -LiteralPath $engineIni) { [IO.File]::ReadAllText($engineIni) } else { '' }
-        [IO.File]::WriteAllText($engineIni, $originalConfig + $graph, $utf8)
-        $gameIni = Join-Path $copyRoot 'Config\DefaultGame.ini'
-        $gameConfig = if (Test-Path -LiteralPath $gameIni) { [IO.File]::ReadAllText($gameIni) } else { '' }
-        $cookAll = if ($mode -eq 'All') { 'True' } else { 'False' }
-        $packaging = "`r`n[/Script/UnrealEd.ProjectPackagingSettings]`r`nbCookAll=$cookAll`r`n"
-        if ($mode -eq 'All') { $packaging += "bCookMapsOnly=False`r`n" }
-        [IO.File]::WriteAllText($gameIni, $gameConfig + $packaging, $utf8)
-        $binaryRoot = Join-Path $copyRoot 'Binaries\Win64'
-        [void][IO.Directory]::CreateDirectory($binaryRoot)
-        foreach ($file in $workerFiles) { [IO.File]::Copy((Join-Path (Join-Path $PSScriptRoot 'Worker') $file), (Join-Path $binaryRoot $file), $false) }
-        $cookToken = [guid]::NewGuid().ToString('N')
-        $settings = [ordered]@{ProjectRoot=$copyRoot;ProjectFile=$copyProject;Python=$python;AdapterScript=$adapterPath;AdapterScriptSha256=$adapterHash;NativeWorker=$nativeWorker;NativeWorkerSha256=$profile.nativeWorkerSha256;CookToken=$cookToken;KeepShaderDebug=[bool]$requestData.ShaderDebug}
-        Write-Json (Join-Path $binaryRoot 'ShaderAdapter.json') $settings
-        $result['CookProject'] = $copyProject
-        $result['CopiedFiles'] = $copiedFiles
-        $result['ReusedFiles'] = $reusedFiles
-        $result['RemovedWorkspaceItems'] = $removedItems
-        $result['PrivateCache'] = $cacheRoot
+        $result['CookProject'] = $cookProject
+        $result['CookedOutput'] = $cookedOutput
         $result['NullRhi'] = $true
         $result.Phase = 'Prepared'
-        $forceVars = 'r.ShaderCompiler.JobCacheDDC=0'
-        if ($requestData.ShaderDebug) { $forceVars += ',r.DumpShaderDebugInfo=1,r.DumpShaderDebugShortNames=1' }
-        $additionalOptions = '-NoDefaultMaps -NoMaterialShaderDDC -ForceGenerateAllChunksInfo -DDC=' + $cacheName + ' -NullRHI -ForceDPCVars=' + $forceVars
         $cookRoots = @()
-        if ($mode -eq 'Folder') { $cookRoots += '-CookDir=' + (Join-Path (Join-Path $copyRoot 'Content') $relativeContent) }
+        if ($mode -eq 'Folder') { $cookRoots += '-CookDir=' + (Join-Path (Join-Path (Split-Path -Parent $cookProject) 'Content') $relativeContent) }
         elseif ($mode -in @('Asset','Map')) { $additionalOptions += ' -Package=' + ($assetPackages -join '+') }
         else { $cookRoots += '-CookAll' }
         if ($arenaCook) {
             $cookRoots += '-VersionCookedContent'
             if ($mapPackages.Count) { $cookRoots += '-map=' + ($mapPackages -join '+') }
         }
-        $arguments = @('-WaitForUATMutex','BuildCookRun',('-project=' + $copyProject),'-targetplatform=Win64','-clientconfig=Development','-nocompileeditor','-skipbuildeditor','-cook') + $cookRoots + @(('-AdditionalCookerOptions=' + $additionalOptions),'-stage','-pak','-iostore','-manifests','-package','-archive',('-archivedirectory=' + (Join-Path $runFolder 'Build')),'-nop4','-utf8output')
+        if ($StockCook) {
+            $cookRoots += '-CookOutputDir=' + $cookedOutput
+            $cookRoots += '-stagingdirectory=' + (Join-Path $runFolder 'Staging')
+        }
+        $arguments = @('-WaitForUATMutex','BuildCookRun',('-project=' + $cookProject),'-targetplatform=Win64','-clientconfig=Development','-nocompileeditor','-skipbuildeditor','-cook') + $cookRoots + @(('-AdditionalCookerOptions=' + $additionalOptions),'-stage','-pak','-iostore','-manifests','-package','-archive',('-archivedirectory=' + (Join-Path $runFolder 'Build')),'-nop4','-utf8output')
         $result['Arguments'] = $arguments
         Write-Json $resultPath $result
         if ($PrepareOnly) {
             $result['StartsCook'] = $false
-            Status 'Project copy prepared; no cook requested.'
+            Status 'Cook prepared. No cook requested.'
             $exitCode = 0
         } else {
-            $env:LIMELIGHT_SHADER_COOK_PROJECT = $copyProject
-            $env:LIMELIGHT_SHADER_COOK_TOKEN = $cookToken
-            $env:LIMELIGHT_SHADER_OODLE = $oodle
-            $env:DOTNET_ROOT = $dotnet[0].DirectoryName
-            $env:PYTHONUTF8 = '1'
             $env:uebp_LogFolder = Join-Path $runFolder 'UATLogs'
             $env:uebp_FinalLogFolder = $env:uebp_LogFolder
             $env:uebp_EngineSavedFolder = Join-Path $runFolder 'AutomationSaved'
             foreach ($folder in @($env:uebp_LogFolder, $env:uebp_EngineSavedFolder)) { [void][IO.Directory]::CreateDirectory($folder) }
             $result.Phase = 'Cooking'
             Write-Json $resultPath $result
-            Status 'Cooking the saved project copy. You can continue editing the source project.'
-            $exitCode = Invoke-CookWithRecovery $uat $arguments $copyProject $runFolder $PSScriptRoot $result $consoleWriter $stallSeconds
+            if ($StockCook) {
+                Status 'Cooking the saved project. Wait until the cook finishes before saving more changes.'
+                $env:LIMELIGHT_SHADER_COOK_PROJECT = $projectFile
+                $env:LIMELIGHT_SHADER_COOK_TOKEN = $runId
+                $env:LIMELIGHT_COOK_PROGRESS_DIR = Join-Path $runFolder 'CookProgress'
+                $planPath = Join-Path $runFolder 'CookPlan.json'
+                Write-Json $planPath ([ordered]@{Uat=$uat;Arguments=$arguments})
+                $powerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+                & $powerShell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Run-Uat.ps1') -Plan $planPath -ShowPhases | ForEach-Object {
+                    $consoleWriter.WriteLine($_)
+                    [Console]::WriteLine($_)
+                }
+                $exitCode = $LASTEXITCODE
+            } else {
+                $env:LIMELIGHT_SHADER_COOK_PROJECT = $copyProject
+                $env:LIMELIGHT_SHADER_COOK_TOKEN = $cookToken
+                $env:LIMELIGHT_SHADER_OODLE = $oodle
+                $env:DOTNET_ROOT = $dotnet[0].DirectoryName
+                $env:PYTHONUTF8 = '1'
+                Status 'Cooking the saved project copy. You can continue editing the source project.'
+                $exitCode = Invoke-CookWithRecovery $uat $arguments $copyProject $runFolder $PSScriptRoot $result $consoleWriter $stallSeconds
+            }
             $result['UatExitCode'] = $exitCode
             if ($exitCode -ne 0) {
                 if ($result.Contains('ShaderWorkerFailure')) { throw ('Shader compilation stopped: ' + $result.ShaderWorkerFailure.Detail + ' See CookMonitor reports and preserved worker diagnostics.') }
                 throw ('UAT failed with exit code ' + $exitCode + '. See Console.txt and UATLogs.')
             }
-            Status 'Checking packaged files and shader-worker reports...'
+            Status 'Checking packaged files...'
             $consoleWriter.Flush()
             $materialWarnings = @(Get-CookMaterialWarnings (Join-Path $runFolder 'Console.txt'))
             $result['MaterialWarnings'] = $materialWarnings
-            $cookedPackages = @(Get-CookedPackageNames $copyProject)
+            $cookedPackages = @(Get-CookedPackageNames $cookProject $cookedOutput)
             $result['CookedPackageCount'] = $cookedPackages.Count
             $result['CookedGamePackages'] = @($cookedPackages | Where-Object { $_.StartsWith('/Game/') })
             $missingPackages = @(Get-MissingCookPackages $cookedPackages $requestedPackages)
@@ -307,8 +349,8 @@ try {
             $pakFiles = @($files | Where-Object { $_.Extension -eq '.pak' -and (Test-Path -LiteralPath ([IO.Path]::ChangeExtension($_.FullName,'.utoc'))) -and (Test-Path -LiteralPath ([IO.Path]::ChangeExtension($_.FullName,'.ucas'))) })
             if (!$pakFiles.Count) { throw 'UAT returned success without a matching pak/utoc/ucas set.' }
             $patchedJobs = 0
-            $workerLogRoot = Join-Path $copyRoot 'Saved\ShaderAdapter\Logs'
-            if (Test-Path -LiteralPath $workerLogRoot) {
+            $workerLogRoot = if (!$StockCook) { Join-Path $copyRoot 'Saved\ShaderAdapter\Logs' }
+            if ($workerLogRoot -and (Test-Path -LiteralPath $workerLogRoot)) {
                 foreach ($logFile in Get-ChildItem -LiteralPath $workerLogRoot -Filter 'worker-*.jsonl' -File) {
                     foreach ($line in Get-Content -LiteralPath $logFile.FullName) {
                         $entry = $line | ConvertFrom-Json
@@ -322,8 +364,8 @@ try {
             $result['PakDirectories'] = @($pakFiles.DirectoryName | Sort-Object -Unique)
             $result.Succeeded = $true
             $result.Phase = 'Completed'
-            if ($materialWarnings.Count) { Status ('Cook completed with material warnings. Check Result.json. Corrected shader jobs: ' + $patchedJobs) }
-            else { Status ('Cook completed. Corrected shader jobs: ' + $patchedJobs + '. Packaged files are in Build.') }
+            if ($materialWarnings.Count) { Status 'Cook completed with material warnings. Check Result.json.' }
+            else { Status 'Cook completed. Packaged files are in Build.' }
         }
     }
 } catch {
@@ -337,6 +379,23 @@ try {
             Save-WorkspaceDiagnostics $runFolder ([bool]$requestData.ShaderDebug -or !$result.Succeeded) ([IO.Path]::GetFileNameWithoutExtension($projectFile))
             $result['DiagnosticsSavedToOutput'] = $true
             if ($result.Succeeded) { Reset-CookWorkspace; $result['CookScratchRemoved'] = $true }
+        } catch {
+            $result['StorageWarning'] = $_.Exception.Message
+            Status ('Cook workspace cleanup needs attention: ' + $_.Exception.Message)
+        }
+    }
+    if ($StockCook -and $result -and $result.Succeeded) {
+        try {
+            $script:workspaceRoot = $runFolder
+            $metadata = Join-Path $cookedOutput ([IO.Path]::GetFileNameWithoutExtension($projectFile) + '\Metadata')
+            if (Test-Path -LiteralPath $metadata -PathType Container) {
+                Assert-WorkspaceTarget $metadata
+                Assert-PhysicalWorkspaceTree $metadata
+                Move-Item -LiteralPath $metadata -Destination (Join-Path $runFolder 'CookMetadata')
+            }
+            Remove-WorkspaceItem (Join-Path $runFolder 'Staging')
+            Remove-WorkspaceItem (Join-Path $runFolder 'Cooked')
+            $result['CookScratchRemoved'] = $true
         } catch {
             $result['StorageWarning'] = $_.Exception.Message
             Status ('Cook workspace cleanup needs attention: ' + $_.Exception.Message)

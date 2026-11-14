@@ -1,6 +1,16 @@
 # Changelog
 
-## 0.2.1 
+## 0.3.0
+
+- **Cook for Dead as Disco** now runs from the saved project using Unreal's
+  stock shader compiler and cache. Wait until the cook finishes before
+  saving more changes. 
+- Cooked and staged files go into the run's output folder. A successful cook
+  clears those temporary files and keeps the packaged files and cook metadata.
+- **Arena map** and **Cook as an arena** still use `-VersionCookedContent`
+  to keep property tags.
+
+## 0.2.1
 
 - Fixed a cook startup error when an Unreal project file contains a trailing
   comma. The cooker now accepts the descriptor and leaves the original project

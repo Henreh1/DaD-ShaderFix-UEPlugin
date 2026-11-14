@@ -1,19 +1,19 @@
 # Limelight Shader Cooker
 
-Current version: **0.2.1**.
+Current version: **0.3.0**.
 
-I use this to cook lit materials for Dead as Disco CL-35029 with the
-Epic UE 5.7.4 editor (CL-51494982). The correction keeps the original material's
-lighting, opacity graph and DBuffer decal response.
+I use this to cook character and arena mods for Dead as Disco with the Epic
+UE 5.7.4 editor (CL-51494982). For game build CL-35199, the editor button
+cooks from the current project with Unreal's stock shader compiler and cache.
 
 > [!IMPORTANT]
 > If you do not already you will need to install Visual Studio's **Game development with C++** tools
 
-I've tested these in-game on 6 November 2026:
+I tested these in-game on 6 November 2026 with the CL-35029 shader compatibility cooker:
 
-| Mod | Renderer | What worked |
-| --- | --- | --- |
-| Chun-Li | DX12 / SM6 | DiveBar load with DBuffer response enabled on ten opaque/masked parents and the original lit translucent eye material. |
+| Mod     | Renderer                  | What worked                                                                                                                 |
+| ------- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Chun-Li | DX12 / SM6                | DiveBar load with DBuffer response enabled on ten opaque/masked parents and the original lit translucent eye material.      |
 | Wallace | DX12 / SM6 and DX11 / SM5 | Selected-label cook, all nine character packages in chunk 1990, and the character loading in the DiveBar on both renderers. |
 
 The game logs confirm the renderers used for the Wallace tests, and the installed
@@ -33,8 +33,8 @@ The output may also contain engine/plugin content and duplicate chunks from
 overlapping labels.
 
 For a C++ project, I reuse its Win64 Development game binaries when the mod kit
-includes them. If they are missing, the cooker builds that target before making
-the cook copy. This needs Visual Studio's **Game development with C++** tools and
+includes them. If they are missing, the cooker builds that target before cooking.
+This needs Visual Studio's **Game development with C++** tools and
 a Windows SDK. There is no separate packaging step. Compiler errors are saved
 to `NativeBuild.txt`; they stop the run before shader compilation starts.
 
@@ -42,7 +42,7 @@ Your existing packaging rules and chunk labels still apply. Selecting an asset
 adds that package and its referenced dependencies; selecting a folder adds all
 packages under it. Selecting a Primary Asset Label requests its explicit,
 directory and collection bundle contents, including nested labels. Asset and
-folder modes turn off the project's Cook All flag in the temporary copy.
+folder modes turn off the project's Cook All flag for that run.
 Cook All requests the entire project, including unused content, while still
 respecting never-cook rules. These modes do not override other
 always-cook folders or force all assets into a new chunk. Check the chunks you
@@ -54,62 +54,26 @@ arena through a data asset label, a folder, or **Cook All**, tick
 use `-VersionCookedContent` to keep property tags. Keep your usual arena paths
 and chunk assignments.
 
-I cooked `LI_Arena_Default` with **Arena map** and loaded it in Infinite Disco
-on CL-35029 (DX12 / SM6).
-
-I save the project before refreshing one separate working copy per project.
-Unchanged files are reused; changed and added files are copied, and files removed
-from the source are removed from the working copy. The copy keeps assets available
-for dependency resolution; it does not select every asset for cooking. Once the
-status says it is cooking, you can keep editing the source project. The cooking
-status cycles its dots while the cook process is running.
-Normal editor previews and normal packaging keep using their existing compiler
-and cache. The copy
-uses a private shader cache and NullRHI, so corrected shaders stay out of the
-stock renderer and shared cache.
-
-Working copies live under `LimelightSC/Projects` in the Windows temporary folder.
-The cooker checks its ownership marker and holds a per-project lock before
-refreshing or cleaning a copy. It refuses linked workspace paths. Old cooked,
-staged and intermediate data is cleared before reuse and after a successful cook.
-The private DDC is reused separately, with Unreal's cleanup of entries unused for
-14 days enabled. It can still be large for large projects. Working copies from
-older versions under `LimelightSC/Runs` are not automatically adopted or deleted.
-
-This version corrects the known `TranslucentBasePass` and `OpaqueBasePass`
-layouts. The opaque correction keeps the material's existing DBuffer decal
-response. Unknown layouts stop the cook instead of producing a
-guessed shader. The cooker retains stock shader logic while aligning the two
-known resource layouts.
+I save the project before cooking it in place. Wait until the cook finishes
+before saving more changes. Cooked and staged files go into that run's output
+folder. A successful run keeps the packaged files and metadata and clears its
+cooked and staged scratch data.
 
 The log panel follows UAT and shows shader progress when UAT is quiet. Elapsed
 time updates independently and stops when the cook ends.
 
 `Console.txt`, `UATLogs` and `Result.json` are saved with each run. Enable **Save
-shader debug files** if you need compiler diagnostics. Normal cooks discard
-completed shader batch captures; debug-enabled cooks retain corrected batches,
-and failed batches are retained. Worker logs, cook metadata and requested debug
-files are moved into that run's output folder before scratch cleanup. An
-interrupted cook's remaining diagnostics are recovered into the next run's
-`PreviousCookDiagnostics` folder. Packaged outputs are kept per run.
-`Result.json` includes the reusable cook project path, copied/reused file counts,
-corrected job count, cleanup warnings and packaged file hashes.
-Material compilation warnings are listed there even when UAT returns success.
+shader debug files** if you need compiler diagnostics. Unreal writes those files
+to the project's `Saved/ShaderDebugInfo` by default. `Result.json` includes the
+selected packages, material compilation warnings and packaged file hashes.
 
-The cook status shows completed worker jobs and batches. **Jobs remaining now**
-includes queued and running jobs. It can go up as Unreal finds more materials;
-zero means the shader queue is empty, and packaging may still be running.
-
-If a shader batch goes 15 minutes without a result, or Unreal reports a worker
-exiting without its result, I save the diagnostics and retry once with lower
-parallelism. This can be slower. A second stall stops the cook. See
-`CookMonitor-attempt-*.json` and `StalledAttempt1` in the output folder.
+**Jobs remaining now** includes queued and running jobs. It can go up as Unreal
+finds more materials. Packaging can continue after the shader queue reaches zero.
 
 The cook report lists the cooked `/Game` packages and checks that selected
 packages were included. A successful engine-only build is not accepted as a mod.
 The source materials and configuration are left as authored. A missing native
 build creates the project's usual generated binaries and intermediate files.
-The temporary copy adds its own cache and shader-worker configuration.
 
 Also yes, I know it says "Bear with me". It was 4am, its staying like that!
 

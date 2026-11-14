@@ -144,7 +144,7 @@ public:
         const FString Script = FullPath(FPaths::Combine(Plugin->GetBaseDir(), TEXT("Resources/Cooker/Cook-Mod.ps1")));
         if (!FPaths::FileExists(Script)) return Fail(TEXT("The cooker payload is missing. Install the complete plugin folder."));
 
-        // I save before making the cook copy so it uses the assets shown in the editor.
+        // The cooker reads the saved assets from disk.
         if (!FEditorFileUtils::SaveDirtyPackages(true, true, true, false, false, false))
             return Fail(TEXT("Cook cancelled because modified assets were not saved."));
         if (bAssetSelection && !FPackageName::DoesPackageExist(AssetPackage))
@@ -167,7 +167,6 @@ public:
         for (const FString& Package : CookPackages) PackageValues.Add(MakeShared<FJsonValueString>(Package));
         Request->SetArrayField(TEXT("AssetPackages"), PackageValues);
         Request->SetStringField(TEXT("OutputRoot"), FullPath(OutputRoot.TrimStartAndEnd()));
-        Request->SetStringField(TEXT("WorkRoot"), FullPath(FPaths::Combine(FPlatformProcess::UserTempDir(), TEXT("LimelightSC"))));
         Request->SetStringField(TEXT("RunId"), RunId);
         Request->SetBoolField(TEXT("ShaderDebug"), bDebug);
         Request->SetBoolField(TEXT("ArenaCook"), Mode == TEXT("Map") || bArenaCook);
@@ -177,7 +176,7 @@ public:
         if (!FFileHelper::SaveStringToFile(Json, *RequestPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
             return Fail(TEXT("Could not write the cook request."));
         const FString PowerShell = FPlatformMisc::GetEnvironmentVariable(TEXT("SystemRoot")) + TEXT("/System32/WindowsPowerShell/v1.0/powershell.exe");
-        const FString Args = TEXT("-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ") + Quote(Script) + TEXT(" -Request ") + Quote(RequestPath);
+        const FString Args = TEXT("-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ") + Quote(Script) + TEXT(" -StockCook -Request ") + Quote(RequestPath);
         State = MakeShared<FProcessState, ESPMode::ThreadSafe>();
         const TSharedRef<FProcessState, ESPMode::ThreadSafe> SharedState = State.ToSharedRef();
         Process = MakeUnique<FMonitoredProcess>(PowerShell, Args, Plugin->GetBaseDir(), true);
@@ -190,10 +189,12 @@ public:
         bCooking = false;
         bCancelling = false;
         bError = false;
-        Status = TEXT("Checking project and preparing a cook copy...");
+        Status = TEXT("Checking project and preparing the cook...");
         Output.Empty();
         LogTail = FCookLogTail();
         NextLogRead = 0.0;
+        NextQueueRead = 0.0;
+        OutstandingJobs.Reset();
         ++LogRevision;
         GConfig->SetString(SettingsSection, TEXT("ContentFolder"), *ContentFolder, GEditorPerProjectIni);
         GConfig->SetString(SettingsSection, TEXT("Mode"), *Mode, GEditorPerProjectIni);
@@ -241,9 +242,21 @@ public:
                         const int32 ElapsedIndex = Status.Find(TEXT(" Elapsed "), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
                         if (ElapsedIndex != INDEX_NONE) Status.LeftInline(ElapsedIndex, EAllowShrinking::No);
                     }
-                    bCooking = bShaderProgress || Status.StartsWith(TEXT("Cooking the saved project copy."));
+                    bCooking = bShaderProgress || Status.StartsWith(TEXT("Cooking the saved project."));
                 }
             }
+        }
+        if (Code == PendingExit && bCooking && Now >= NextQueueRead)
+        {
+            NextQueueRead = Now + 2.0;
+            const TOptional<int64> Jobs = ReadOutstandingJobs();
+            if (Jobs.IsSet() && Jobs != OutstandingJobs && LogTail.IsUatLog())
+            {
+                if (!Output.IsEmpty() && !Output.EndsWith(TEXT("\n"))) Output.AppendChar('\n');
+                Output += TEXT("[Cooker] ") + ShaderQueueStatus(Jobs.GetValue()) + TEXT("\n");
+                bPipeOutputChanged = true;
+            }
+            OutstandingJobs = Jobs;
         }
         if (bPipeOutputChanged)
         {
@@ -288,8 +301,9 @@ public:
         if (!bRunning || !bCooking) return Status;
         const int32 Dots = 1 + static_cast<int32>(FPlatformTime::Seconds() * 2.0) % 3;
         const FString Heading = TEXT("Cooking, bear with me :D ") + FString::ChrN(Dots, TEXT('.'));
+        if (OutstandingJobs.IsSet()) return Heading + TEXT("\n") + ShaderQueueStatus(OutstandingJobs.GetValue());
         if (Status.StartsWith(TEXT("Compiling shaders:"))) return Heading + TEXT("\n") + Status;
-        return Heading + TEXT("\nProject copy ready. You can continue editing the source project.");
+        return Heading + TEXT("\nWait until the cook finishes before saving more changes.");
     }
 
     FString DisplayElapsed(double Now) const
@@ -325,6 +339,39 @@ public:
     uint64 LogRevision = 0;
 
 private:
+    static FString ShaderQueueStatus(int64 Jobs)
+    {
+        return FString::Printf(TEXT("Compiling shaders: %lld engine jobs remaining now (queued/running)."), Jobs);
+    }
+
+    TOptional<int64> ReadOutstandingJobs() const
+    {
+        const FString Directory = FPaths::Combine(LastOutput, TEXT("CookProgress"));
+        const FString RunId = FPaths::GetCleanFilename(LastOutput);
+        TArray<FString> Files;
+        IFileManager::Get().FindFiles(Files, *FPaths::Combine(Directory, TEXT("Queue-*.json")), true, false);
+        TOptional<int64> Total;
+        for (const FString& File : Files)
+        {
+            FString Text;
+            TSharedPtr<FJsonObject> Snapshot;
+            if (!FFileHelper::LoadFileToString(Text, *FPaths::Combine(Directory, File))
+                || !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Text), Snapshot) || !Snapshot) continue;
+            FString Token, Timestamp;
+            FDateTime Updated;
+            bool bActive = false;
+            int32 Jobs = 0;
+            if (!Snapshot->TryGetStringField(TEXT("CookToken"), Token) || Token != RunId
+                || !Snapshot->TryGetBoolField(TEXT("Running"), bActive) || !bActive
+                || !Snapshot->TryGetNumberField(TEXT("OutstandingJobs"), Jobs) || Jobs < 0
+                || !Snapshot->TryGetStringField(TEXT("UpdatedUtc"), Timestamp)
+                || !FDateTime::ParseIso8601(*Timestamp, Updated)) continue;
+            const double Age = (FDateTime::UtcNow() - Updated).GetTotalSeconds();
+            if (Age >= -5.0 && Age <= 10.0) Total = Total.Get(0) + Jobs;
+        }
+        return Total;
+    }
+
 #if WITH_DEV_AUTOMATION_TESTS
     friend class FCookProgressPanelTest;
 #endif
@@ -333,6 +380,8 @@ private:
     double StartedAt = -1.0;
     double FinishedAt = -1.0;
     double NextLogRead = 0.0;
+    double NextQueueRead = 0.0;
+    TOptional<int64> OutstandingJobs;
     FCookLogTail LogTail;
     TUniquePtr<FMonitoredProcess> Process;
     TSharedPtr<FProcessState, ESPMode::ThreadSafe> State;
@@ -406,7 +455,7 @@ public:
                     + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 8)
                     [ SNew(STextBlock).Text(LOCTEXT("Title", "Cook for Dead as Disco")).TextStyle(FAppStyle::Get(), "DetailsView.CategoryTextStyle") ]
                     + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 14)
-                    [ SNew(STextBlock).Text(LOCTEXT("Scope", "For Dead as Disco CL-35029 and Epic UE 5.7.4. Preserves lit materials, translucency and the material's DBuffer decal response.")).AutoWrapText(true) ]
+                    [ SNew(STextBlock).Text(LOCTEXT("Scope", "Cook for Dead as Disco CL-35199 with Epic UE 5.7.4. Uses the current project and Unreal's stock shader compiler.")).AutoWrapText(true) ]
                     + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 14)
                     [ SNew(STextBlock).Text(FText::FromString(FullPath(FPaths::GetProjectFilePath()))).AutoWrapText(true).ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
                     + SVerticalBox::Slot().AutoHeight()[ SNew(STextBlock).Text(LOCTEXT("ModeLabel", "What to cook")) ]

@@ -93,7 +93,10 @@ public:
         const FString Token = FPlatformMisc::GetEnvironmentVariable(TEXT("LIMELIGHT_SHADER_COOK_TOKEN"));
         if (ExpectedProject.IsEmpty() || Token.IsEmpty() || !GShaderCompilingManager) return;
         if (!FPaths::IsSamePath(FPaths::ConvertRelativePathToFull(ExpectedProject), FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath()))) return;
-        const FString Directory = FPaths::ConvertRelativePathToFull(FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("ShaderAdapter/Progress")));
+        const FString RunProgress = FPlatformMisc::GetEnvironmentVariable(TEXT("LIMELIGHT_COOK_PROGRESS_DIR"));
+        const FString Directory = RunProgress.IsEmpty()
+            ? FPaths::ConvertRelativePathToFull(FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("ShaderAdapter/Progress")))
+            : RunProgress;
         if (!IFileManager::Get().MakeDirectory(*Directory, true)) return;
         const FString Filename = FString::Printf(TEXT("Queue-%u.json"), FPlatformProcess::GetCurrentProcessId());
         Sampler = MakeUnique<FCookQueueSampler>(GShaderCompilingManager, FPaths::Combine(Directory, Filename), Token);

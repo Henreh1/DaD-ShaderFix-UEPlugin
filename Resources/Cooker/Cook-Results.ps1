@@ -11,9 +11,10 @@ function Get-CookMaterialWarnings([string]$LogPath) {
     } finally { $reader.Dispose() }
 }
 
-function Get-CookedPackageNames([string]$CookProject) {
+function Get-CookedPackageNames([string]$CookProject, [string]$CookedOutput) {
     $projectName = [IO.Path]::GetFileNameWithoutExtension($CookProject)
-    $metadata = Join-Path (Split-Path -Parent $CookProject) ('Saved\Cooked\Windows\' + $projectName + '\Metadata\AllChunksInfo.csv')
+    if (!$CookedOutput) { $CookedOutput = Join-Path (Split-Path -Parent $CookProject) 'Saved\Cooked\Windows' }
+    $metadata = Join-Path $CookedOutput ($projectName + '\Metadata\AllChunksInfo.csv')
     if (!(Test-Path -LiteralPath $metadata -PathType Leaf)) { throw 'The cook package inventory is missing. Selected content could not be verified.' }
     $rows = @(Import-Csv -LiteralPath $metadata)
     if (!$rows.Count) { throw 'The cook package inventory is empty.' }
